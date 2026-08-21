@@ -31,6 +31,7 @@ pub struct ToolCtx {
     pub chat_id: ChatId,
     pub approvals: ApprovalManager,
     pub bash_timeout: std::time::Duration,
+    pub approval_timeout: std::time::Duration,
 }
 
 // --------------------------------------------------------------------- bash
@@ -80,6 +81,7 @@ impl Tool for Bash {
             &ctx.bot,
             ctx.chat_id,
             &ctx.approvals,
+            ctx.approval_timeout,
             "bash",
             &format!("执行命令:`{}`", args.command),
         )
@@ -87,14 +89,14 @@ impl Tool for Bash {
         .map_err(ToolErr)?;
 
         if !approved {
-            log::info!("bash 被用户拒绝: {}", args.command);
+            tracing::info!("bash 被用户拒绝: {}", args.command);
             return Ok(format!(
                 "用户拒绝了执行命令 `{}`,请换一种方式或追问用户。",
                 args.command
             ));
         }
 
-        log::info!("bash 开始执行: {}", args.command);
+        tracing::info!("bash 开始执行: {}", args.command);
 
         let future = tokio::process::Command::new("bash")
             .arg("-lc")
@@ -103,7 +105,7 @@ impl Tool for Bash {
 
         match tokio::time::timeout(ctx.bash_timeout, future).await {
             Ok(Ok(output)) => {
-                log::info!(
+                tracing::info!(
                     "bash 完成: {} exit={}",
                     args.command,
                     output.status.code().unwrap_or(-1),
@@ -123,7 +125,7 @@ impl Tool for Bash {
             }
             Ok(Err(e)) => Err(ToolErr(format!("命令启动失败: {e}"))),
             Err(_) => {
-                log::warn!(
+                tracing::warn!(
                     "bash 超时: {} ({}s)",
                     args.command,
                     ctx.bash_timeout.as_secs()

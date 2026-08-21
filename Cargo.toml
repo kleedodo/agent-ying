@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-env_logger = "0.11.11"
-log = "0.4.33"
-pretty_env_logger = "0.5"
 rig = "0.40" # 默认 feature 已启用 rustls
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -16,3 +13,5 @@ thiserror = "2.0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "process", "time"] }
 # 关掉默认的 native-tls,全链路统一走 rustls
 teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "rustls"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

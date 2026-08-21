@@ -13,9 +13,6 @@ use tokio::time::Duration;
 /// 每个 chat 最近一条审批消息:消息 id、审批 id、原文(用于被取代时保留详情)
 type LastApproval = HashMap<ChatId, (MessageId, String, String)>;
 
-/// 审批等待超时:超过则按拒绝处理,避免 agent 永远挂在「思考中」。
-const APPROVAL_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// 从审批消息原文里提取工具/命令信息:去掉开头的 🔧 和结尾的「是否放行?」。
 /// 用于把消息改成「已同意/已超时/已被取代」等状态时保留详情,方便回看。
 pub fn approval_body(original: &str) -> String {
@@ -59,7 +56,7 @@ impl ApprovalManager {
             ),
         ) {
             if let Some(tx) = self.pending.lock().await.remove(&prev_approval_id) {
-                log::info!("旧审批被新审批取代,自动按拒绝处理: {}", prev_approval_id);
+                tracing::info!("旧审批被新审批取代,自动按拒绝处理: {}", prev_approval_id);
                 let _ = tx.send(false);
             }
             if prev_msg_id != message_id {
@@ -113,6 +110,7 @@ pub async fn request_approval(
     bot: &Bot,
     chat_id: ChatId,
     approvals: &ApprovalManager,
+    timeout: Duration,
     tool: &str,
     detail: &str,
 ) -> Result<bool, String> {
@@ -123,7 +121,7 @@ pub async fn request_approval(
         InlineKeyboardButton::callback("❌ 拒绝", format!("deny:{id}")),
     ]]);
 
-    log::info!(
+    tracing::info!(
         "审批请求: chat={} tool={} detail={:?}",
         chat_id,
         tool,
@@ -141,13 +139,13 @@ pub async fn request_approval(
         .await;
 
     // 超时或 rx 被 drop(sender 没了)都按拒绝处理
-    let approved = match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
+    let approved = match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(v)) => v,
         Ok(Err(_)) => false,
         Err(_) => {
-            log::warn!(
+            tracing::warn!(
                 "审批超时({}s),按拒绝处理: chat={} tool={}",
-                APPROVAL_TIMEOUT.as_secs(),
+                timeout.as_secs(),
                 chat_id,
                 tool,
             );
@@ -169,7 +167,7 @@ pub async fn request_approval(
         }
     };
     if !approved {
-        log::info!("审批被拒绝: chat={} tool={}", chat_id, tool);
+        tracing::info!("审批被拒绝: chat={} tool={}", chat_id, tool);
     }
     Ok(approved)
 }

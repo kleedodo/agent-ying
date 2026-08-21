@@ -34,6 +34,7 @@ struct AppState {
     model: String,
     system_prompt: String,
     bash_timeout: Duration,
+    approval_timeout: Duration,
     allowed_user_ids: Vec<UserId>,
 }
 
@@ -51,6 +52,7 @@ impl AppState {
             chat_id,
             approvals: self.approvals.clone(),
             bash_timeout: self.bash_timeout,
+            approval_timeout: self.approval_timeout,
         };
         self.client
             .agent(self.model.clone())
@@ -69,7 +71,7 @@ fn spawn_heartbeat(last_update_id: Arc<AtomicU64>) {
         ticker.tick().await; // 第一次立即完成,跳过
         loop {
             ticker.tick().await;
-            log::info!(
+            tracing::info!(
                 "心跳: 最近 update id = {}",
                 last_update_id.load(Ordering::Relaxed)
             );
@@ -92,22 +94,29 @@ fn build_handler() -> dptree::Handler<
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 日志不依赖 RUST_LOG 环境变量,固定 Info 级别
-    let _ = env_logger::Builder::new()
-        .filter_level(log::LevelFilter::Info)
-        .try_init();
+    // 默认 Info 级别,可通过 RUST_LOG 环境变量覆盖
+    // tracing-log 桥接:teloxide 等依赖的 log 宏输出也会走 tracing
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .init();
 
     // 所有配置都从 ~/.agent-ying/config.json 读取(不存在时写出默认模板)
     let config = Config::load()?;
     let bash_timeout = Duration::from_secs(config.bash_timeout_secs);
-    log::info!(
-        "配置加载完成: model={}, base_url={}, bash 超时 {}s, 白名单 {} 人",
+    let approval_timeout = Duration::from_secs(config.approval_timeout_secs);
+    tracing::info!(
+        "配置加载完成: model={}, base_url={}, bash 超时 {}s, 审批超时 {}s, 白名单 {} 人",
         config.model,
         config
             .openai_base_url
             .as_deref()
             .unwrap_or("(官方 api.openai.com)"),
         config.bash_timeout_secs,
+        config.approval_timeout_secs,
         config.allowed_user_ids.len(),
     );
 
@@ -126,7 +135,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     bot.set_my_commands(Vec::<BotCommand>::new()).await?;
     bot.set_my_commands([BotCommand::new("new", "开启新会话(清空对话历史)")])
         .await?;
-    log::info!("Telegram bot 就绪,已注册命令 /new");
+    tracing::info!("Telegram bot 就绪,已注册命令 /new");
 
     let last_update_id = Arc::new(AtomicU64::new(0));
     let state = AppState {
@@ -137,6 +146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         model: config.model,
         system_prompt,
         bash_timeout,
+        approval_timeout,
         allowed_user_ids: config.allowed_user_ids,
     };
 
@@ -158,7 +168,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await
         .build();
 
-    log::info!("开始接收 Telegram 更新(等待消息,长轮询 5s)…");
+    tracing::info!("开始接收 Telegram 更新(等待消息,长轮询 5s)…");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
@@ -176,7 +186,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             LoggingErrorHandler::with_custom_text("更新监听器出错"),
         )
         .await;
-    log::info!("已退出 dispatch(通常是 Ctrl-C)");
+    tracing::info!("已退出 dispatch(通常是 Ctrl-C)");
 
     Ok(())
 }

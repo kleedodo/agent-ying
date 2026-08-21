@@ -7,6 +7,7 @@ use teloxide::types::UserId;
 
 pub const DEFAULT_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是 ying,一个跑在用户电脑上的 agent,通过 Telegram 与用户对话。
 
@@ -35,6 +36,9 @@ pub struct Config {
     pub system_prompt: Option<String>,
     /// bash 工具超时(秒)
     pub bash_timeout_secs: u64,
+    /// 审批等待超时(秒),超过则按拒绝处理
+    #[serde(default = "default_approval_timeout_secs")]
+    pub approval_timeout_secs: u64,
     /// 只响应这些 Telegram user id;留空则响应所有人
     #[serde(default)]
     pub allowed_user_ids: Vec<UserId>,
@@ -49,9 +53,14 @@ impl Default for Config {
             model: DEFAULT_MODEL.to_string(),
             system_prompt: None,
             bash_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
+            approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             allowed_user_ids: Vec::new(),
         }
     }
+}
+
+fn default_approval_timeout_secs() -> u64 {
+    DEFAULT_APPROVAL_TIMEOUT_SECS
 }
 
 fn home_dir() -> PathBuf {
@@ -82,7 +91,7 @@ impl Config {
         if !path.exists() {
             let template = Self::default();
             fs::write(&path, serde_json::to_string_pretty(&template)?)?;
-            log::info!("已写入默认配置: {}", path.display());
+            tracing::info!("已写入默认配置: {}", path.display());
         }
 
         let cfg: Config = serde_json::from_str(&fs::read_to_string(&path)?)?;
@@ -102,7 +111,7 @@ impl Config {
     pub fn resolve_system_prompt(&self) -> String {
         let md = Self::system_md_path();
         if let Ok(content) = fs::read_to_string(&md) {
-            log::info!("系统提示词使用 {}", md.display());
+            tracing::info!("系统提示词使用 {}", md.display());
             return content;
         }
         self.system_prompt
