@@ -5,16 +5,13 @@ mod tools;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use rig::client::CompletionClient;
 use rig::completion::Message;
 use rig::providers::openai;
-use teloxide::error_handlers::LoggingErrorHandler;
 use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatId, UpdateKind, UserId};
-use teloxide::update_listeners::Polling;
 use tokio::sync::Mutex;
 
 use approval::ApprovalManager;
@@ -75,21 +72,6 @@ impl AppState {
             .default_max_turns(self.max_turns)
             .build()
     }
-}
-
-/// 每 60s 打印一次「最近 update id」:按钮点了没反应时,先看这个 id 有没有在涨。
-fn spawn_heartbeat(last_update_id: Arc<AtomicU64>) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(Duration::from_secs(60));
-        ticker.tick().await; // 第一次立即完成,跳过
-        loop {
-            ticker.tick().await;
-            tracing::info!(
-                "心跳: 最近 update id = {}",
-                last_update_id.load(Ordering::Relaxed)
-            );
-        }
-    });
 }
 
 /// 构建 dptree handler(启动和测试共用)。
@@ -154,7 +136,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .await?;
     tracing::info!("Telegram bot 就绪,已注册命令 /new");
 
-    let last_update_id = Arc::new(AtomicU64::new(0));
     let state = AppState {
         bot: bot.clone(),
         client,
@@ -171,25 +152,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         max_tokens: config.max_tokens,
     };
 
-    spawn_heartbeat(last_update_id.clone());
+    let handler = build_handler();
 
-    // 每个进 dispatcher 的 update 都先记一下 id,再接真正的 handler
-    let handler = dptree::entry()
-        .filter_map(move |update: Update| {
-            last_update_id.store(update.id.0 as u64, Ordering::Relaxed);
-            Some(update)
-        })
-        .chain(build_handler());
-
-    // 自定义长轮询:timeout 从默认 10s 降到 5s,
-    // 网络抖动/代理拖住单个请求时,回调最多被滞留 ~6s 而不是 ~17s
-    let listener = Polling::builder(bot.clone())
-        .timeout(Duration::from_secs(5))
-        .delete_webhook()
-        .await
-        .build();
-
-    tracing::info!("开始接收 Telegram 更新(等待消息,长轮询 5s)…");
+    tracing::info!("开始接收 Telegram 更新(等待消息)…");
     Dispatcher::builder(bot, handler)
         .dependencies(dptree::deps![state])
         .enable_ctrlc_handler()
@@ -202,10 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             _ => upd.chat().map(|c| c.id),
         })
         .build()
-        .dispatch_with_listener(
-            listener,
-            LoggingErrorHandler::with_custom_text("更新监听器出错"),
-        )
+        .dispatch()
         .await;
     tracing::info!("已退出 dispatch(通常是 Ctrl-C)");
 
