@@ -2,6 +2,7 @@
 name = "agent-ying"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 rig = "0.40" # 默认 feature 已启用 rustls
