@@ -21,7 +21,7 @@ use approval::ApprovalManager;
 use config::Config;
 use handlers::{on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
-use tools::{Bash, ToolCtx};
+use tools::{Bash, SendFile, ToolCtx};
 
 // 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
 #[global_allocator]
@@ -67,7 +67,8 @@ impl AppState {
             .agent(self.model.clone())
             .name(&self.name)
             .preamble(&self.system_prompt)
-            .tool(Bash(ctx))
+            .tool(Bash(ctx.clone()))
+            .tool(SendFile(ctx))
             // 采样参数与最大轮数都从配置读取
             .temperature(self.temperature)
             .max_tokens(self.max_tokens)

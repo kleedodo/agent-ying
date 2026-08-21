@@ -201,7 +201,8 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                 .send_message(
                     msg.chat.id,
                     "👋 我是 ying!直接发文本或图片就行。\n\
-                     我可以用 `bash` 跑命令,也能看你发的图片。\n\
+                     我可以用 `bash` 跑命令,也能看你发的图片,\n\
+                     还能把文件直接发给你(send_file)。\n\
                      每次调用工具前都会发按钮请你明确同意。\n\
                      发送 /new 可以开启新会话(清空对话历史)。",
                 )
