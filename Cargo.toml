@@ -14,4 +14,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", 
 # 关掉默认的 native-tls,全链路统一走 rustls
 teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "rustls"] }
 tracing = "0.1.44"
+# mimalloc 内存分配器,跨平台(含 musl 静态链接),抗碎片、多线程友好
+mimalloc = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

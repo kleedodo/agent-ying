@@ -20,7 +20,12 @@ use tokio::sync::Mutex;
 use approval::ApprovalManager;
 use config::Config;
 use handlers::{on_callback, on_message, on_unmatched};
+use mimalloc::MiMalloc;
 use tools::{Bash, ToolCtx};
+
+// 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 /// 使用 OpenAI Chat Completions API(兼容大部分第三方网关)。
 type YingAgent = rig::agent::Agent<openai::CompletionModel>;
