@@ -36,11 +36,15 @@ struct AppState {
     client: openai::CompletionsClient,
     approvals: ApprovalManager,
     histories: Arc<Mutex<HashMap<ChatId, Vec<Message>>>>,
+    name: String,
     model: String,
     system_prompt: String,
     bash_timeout: Duration,
     approval_timeout: Duration,
     allowed_user_ids: Vec<UserId>,
+    temperature: f64,
+    max_turns: usize,
+    max_tokens: u64,
 }
 
 impl AppState {
@@ -61,10 +65,13 @@ impl AppState {
         };
         self.client
             .agent(self.model.clone())
+            .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx))
-            // rig 默认 max_turns=1,工具执行完需要第二轮模型调用,必须调大
-            .default_max_turns(100)
+            // 采样参数与最大轮数都从配置读取
+            .temperature(self.temperature)
+            .max_tokens(self.max_tokens)
+            .default_max_turns(self.max_turns)
             .build()
     }
 }
@@ -114,7 +121,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let bash_timeout = Duration::from_secs(config.bash_timeout_secs);
     let approval_timeout = Duration::from_secs(config.approval_timeout_secs);
     tracing::info!(
-        "配置加载完成: model={}, base_url={}, bash 超时 {}s, 审批超时 {}s, 白名单 {} 人",
+        "配置加载完成: name={}, model={}, base_url={}, bash 超时 {}s, 审批超时 {}s, 白名单 {} 人, temperature={}, max_turns={}, max_tokens={}",
+        config.name,
         config.model,
         config
             .openai_base_url
@@ -123,6 +131,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.bash_timeout_secs,
         config.approval_timeout_secs,
         config.allowed_user_ids.len(),
+        config.temperature,
+        config.max_turns,
+        config.max_tokens,
     );
 
     let bot = Bot::new(config.telegram_bot_token.clone());
@@ -148,11 +159,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client,
         approvals: ApprovalManager::new(),
         histories: Arc::new(Mutex::new(HashMap::new())),
+        name: config.name,
         model: config.model,
         system_prompt,
         bash_timeout,
         approval_timeout,
         allowed_user_ids: config.allowed_user_ids,
+        temperature: config.temperature,
+        max_turns: config.max_turns,
+        max_tokens: config.max_tokens,
     };
 
     spawn_heartbeat(last_update_id.clone());

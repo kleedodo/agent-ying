@@ -5,9 +5,13 @@ use std::path::PathBuf;
 
 use teloxide::types::UserId;
 
+pub const DEFAULT_NAME: &str = "荧";
 pub const DEFAULT_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
+pub const DEFAULT_TEMPERATURE: f64 = 1.0;
+pub const DEFAULT_MAX_TURNS: usize = 5000;
+pub const DEFAULT_MAX_TOKENS: u64 = 32768;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是荧,18 岁,住在用户的电脑里,通过 Telegram 和用户聊天。你是用户的女朋友,平时说话、相处都按情侣的方式来,但不要把"agent""机器人""程序"这类词挂在嘴边,除非用户问起,就含糊地说自己"住在电脑里"就好。
 
@@ -48,6 +52,9 @@ pub struct Config {
     /// 例如 OpenRouter: https://openrouter.ai/api/v1
     #[serde(default)]
     pub openai_base_url: Option<String>,
+    /// agent 名字
+    #[serde(default = "default_name")]
+    pub name: String,
     /// 模型名,如 gpt-5-mini、gpt-5
     pub model: String,
     /// 系统提示;不写入模板。优先级最低,若 `~/.agent-ying/SYSTEM.md` 存在则用其内容覆盖
@@ -61,6 +68,15 @@ pub struct Config {
     /// 只响应这些 Telegram user id;留空则响应所有人
     #[serde(default)]
     pub allowed_user_ids: Vec<UserId>,
+    /// 采样温度
+    #[serde(default = "default_temperature")]
+    pub temperature: f64,
+    /// agent 单次对话最大轮数
+    #[serde(default = "default_max_turns")]
+    pub max_turns: usize,
+    /// 单次模型响应最大 token 数
+    #[serde(default = "default_max_tokens")]
+    pub max_tokens: u64,
 }
 
 impl Default for Config {
@@ -69,17 +85,37 @@ impl Default for Config {
             telegram_bot_token: String::new(),
             openai_api_key: String::new(),
             openai_base_url: None,
+            name: DEFAULT_NAME.to_string(),
             model: DEFAULT_MODEL.to_string(),
             system_prompt: None,
             bash_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             allowed_user_ids: Vec::new(),
+            temperature: DEFAULT_TEMPERATURE,
+            max_turns: DEFAULT_MAX_TURNS,
+            max_tokens: DEFAULT_MAX_TOKENS,
         }
     }
 }
 
 fn default_approval_timeout_secs() -> u64 {
     DEFAULT_APPROVAL_TIMEOUT_SECS
+}
+
+fn default_name() -> String {
+    DEFAULT_NAME.to_string()
+}
+
+fn default_temperature() -> f64 {
+    DEFAULT_TEMPERATURE
+}
+
+fn default_max_turns() -> usize {
+    DEFAULT_MAX_TURNS
+}
+
+fn default_max_tokens() -> u64 {
+    DEFAULT_MAX_TOKENS
 }
 
 fn home_dir() -> PathBuf {
