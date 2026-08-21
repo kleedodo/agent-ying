@@ -13,6 +13,10 @@ thiserror = "2.0.20"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "fs", "process", "time"] }
 # 关掉默认的 native-tls,全链路统一走 rustls
 teloxide = { version = "0.17", default-features = false, features = ["ctrlc_handler", "rustls"] }
+# 图片 base64 编码(把用户发的图片以 data URL 形式喂给多模态模型)
+base64 = "0.22"
+# 图片解码/重编码:大图压缩到 256KB 以下再喂给模型。只开用到的编解码器,控制体积
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 tracing = "0.1.44"
 # mimalloc 内存分配器,跨平台(含 musl 静态链接),抗碎片、多线程友好
 mimalloc = "0.1"

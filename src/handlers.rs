@@ -1,12 +1,177 @@
 //! Telegram 更新处理器:文本消息 → 跑 agent;按钮回调 → 决定工具审批。
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use rig::OneOrMany;
+use rig::completion::message::{
+    DocumentSourceKind, Image as RigImage, ImageMediaType, Text as RigText, UserContent,
+};
 use rig::completion::{Chat, Message as RigMessage};
+use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::InlineKeyboardMarkup;
+use teloxide::types::{FileId, InlineKeyboardMarkup};
 
 use crate::{AppState, approval::approval_body};
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+/// 从 Telegram 消息构建发给模型的用户消息。
+/// 支持:图片(photo,或 image/* 的 document,可带说明文字)、纯文本。
+/// 返回 None 表示既不是文本也不是受支持的图片(如贴纸、视频等)。
+async fn build_user_message(
+    bot: &Bot,
+    msg: &Message,
+) -> Result<Option<RigMessage>, Box<dyn std::error::Error + Send + Sync>> {
+    // 1. 图片:photo 优先(总是 JPEG),其次 image/* 的 document
+    if let Some(photo) = msg.photo().as_ref().and_then(|photos| photos.last()) {
+        let bytes = download_file_bytes(bot, &photo.file.id).await?;
+        let caption = msg.caption().map(str::to_string).unwrap_or_default();
+        return Ok(Some(image_user_message(
+            caption,
+            bytes,
+            ImageMediaType::JPEG,
+        )));
+    }
+    if let Some(doc) = msg.document().as_ref()
+        && let Some(media_type) = doc
+            .mime_type
+            .as_ref()
+            .and_then(|mime| mime_to_image_media_type(mime.as_ref()))
+    {
+        let bytes = download_file_bytes(bot, &doc.file.id).await?;
+        let caption = msg.caption().map(str::to_string).unwrap_or_default();
+        return Ok(Some(image_user_message(caption, bytes, media_type)));
+    }
+
+    // 2. 纯文本
+    if let Some(text) = msg.text().map(str::to_owned) {
+        return Ok(Some(RigMessage::User {
+            content: OneOrMany::one(UserContent::Text(RigText {
+                text,
+                additional_params: None,
+            })),
+        }));
+    }
+
+    Ok(None)
+}
+
+/// 下载 Telegram 文件为字节。
+async fn download_file_bytes(
+    bot: &Bot,
+    file_id: &FileId,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let file = bot.get_file(file_id.clone()).await?;
+    let mut buf: Vec<u8> = Vec::new();
+    bot.download_file(&file.path, &mut buf).await?;
+    Ok(buf)
+}
+
+/// 大图压缩上限:256KB。超过则重编码为 JPEG 并逐步降质/缩小,直到不超过该值。
+const MAX_IMAGE_BYTES: usize = 256 * 1024;
+
+/// 若图片超过 256KB,则解码后重编码为 JPEG,逐步降低质量与尺寸,直到不超过上限。
+/// 返回 (新字节, 对应 media_type)。未超限时原样返回。
+fn compress_image(bytes: Vec<u8>, media_type: ImageMediaType) -> (Vec<u8>, ImageMediaType) {
+    if bytes.len() <= MAX_IMAGE_BYTES {
+        return (bytes, media_type);
+    }
+
+    let Ok(img) = image::load_from_memory(&bytes) else {
+        // 解不了(如未启用解码器的 heic/svg),退而求其次:原样返回
+        return (bytes, media_type);
+    };
+
+    let base_w = img.width() as f64;
+    let base_h = img.height() as f64;
+
+    // 从大到小尝试:每个尺寸只缩放/转换一次,再在该尺寸上依次降质量。
+    // 这样避免对同一尺寸反复做昂贵的重采样。
+    for scale in [1.0f64, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2] {
+        let rgb = if scale >= 1.0 {
+            to_rgb8_white_bg(&img)
+        } else {
+            let w = (base_w * scale).max(1.0) as u32;
+            let h = (base_h * scale).max(1.0) as u32;
+            // Triangle 滤镜比 Lanczos3 快得多,对喂给视觉模型已足够
+            let resized = img.resize_exact(w, h, image::imageops::FilterType::Triangle);
+            to_rgb8_white_bg(&resized)
+        };
+        for quality in [85u8, 75, 65, 55, 45, 35] {
+            let mut buf = Vec::new();
+            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
+            if encoder.encode_image(&rgb).is_ok() && buf.len() <= MAX_IMAGE_BYTES {
+                return (buf, ImageMediaType::JPEG);
+            }
+        }
+    }
+
+    // 兜底:最小尺寸最低质量(几乎不可能还超,但保证有返回值)
+    let rgb = to_rgb8_white_bg(&img.resize_exact(64, 64, image::imageops::FilterType::Triangle));
+    let mut buf = Vec::new();
+    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 30);
+    encoder.encode_image(&rgb).ok();
+    (buf, ImageMediaType::JPEG)
+}
+
+/// 转成 RGB8;带透明通道(PNG 等)时合成到白底,避免透明区变黑。
+fn to_rgb8_white_bg(img: &image::DynamicImage) -> image::RgbImage {
+    match img {
+        image::DynamicImage::ImageRgba8(rgba) => {
+            let mut out = image::RgbImage::new(rgba.width(), rgba.height());
+            for (x, y, px) in rgba.enumerate_pixels() {
+                let a = px[3] as f32 / 255.0;
+                let r = (px[0] as f32 * a + 255.0 * (1.0 - a)) as u8;
+                let g = (px[1] as f32 * a + 255.0 * (1.0 - a)) as u8;
+                let b = (px[2] as f32 * a + 255.0 * (1.0 - a)) as u8;
+                out.put_pixel(x, y, image::Rgb([r, g, b]));
+            }
+            out
+        }
+        other => other.to_rgb8(),
+    }
+}
+
+/// 把 Telegram 的 MIME 字符串映射到 rig 支持的图片类型,不支持返回 None。
+fn mime_to_image_media_type(mime: &str) -> Option<ImageMediaType> {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => Some(ImageMediaType::JPEG),
+        "image/png" => Some(ImageMediaType::PNG),
+        "image/gif" => Some(ImageMediaType::GIF),
+        "image/webp" => Some(ImageMediaType::WEBP),
+        "image/heic" => Some(ImageMediaType::HEIC),
+        "image/heif" => Some(ImageMediaType::HEIF),
+        "image/svg+xml" => Some(ImageMediaType::SVG),
+        _ => None,
+    }
+}
+
+/// 构造「说明文字 + 图片」的用户消息。
+fn image_user_message(caption: String, bytes: Vec<u8>, media_type: ImageMediaType) -> RigMessage {
+    // 大图先压缩到 256KB 以下,再 base64
+    let (bytes, media_type) = compress_image(bytes, media_type);
+    let b64 = BASE64.encode(&bytes);
+    let image = UserContent::Image(RigImage {
+        data: DocumentSourceKind::base64(&b64),
+        media_type: Some(media_type),
+        detail: None,
+        additional_params: None,
+    });
+    let text = if caption.trim().is_empty() {
+        "(用户发了一张图片)".to_string()
+    } else {
+        caption
+    };
+    let content = OneOrMany::many(vec![
+        UserContent::Text(RigText {
+            text,
+            additional_params: None,
+        }),
+        image,
+    ])
+    .expect("至少包含文本和图片两项内容");
+    RigMessage::User { content }
+}
 
 /// 处理用户发来的文本消息:跑一轮 agent 对话(带多轮历史)。
 pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
@@ -26,37 +191,42 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         return Ok(());
     }
 
-    let Some(text) = msg.text().map(str::to_owned) else {
+    let text = msg.text().map(str::to_owned);
+
+    // 简单的 /start、/help、/new 命令(文本消息)
+    if let Some(t) = &text {
+        if t.starts_with("/start") || t.starts_with("/help") {
+            state
+                .bot
+                .send_message(
+                    msg.chat.id,
+                    "👋 我是 ying!直接发文本或图片就行。\n\
+                     我可以用 `bash` 跑命令,也能看你发的图片。\n\
+                     每次调用工具前都会发按钮请你明确同意。\n\
+                     发送 /new 可以开启新会话(清空对话历史)。",
+                )
+                .await?;
+            return Ok(());
+        }
+        if t.starts_with("/new") {
+            let mut map = state.histories.lock().await;
+            map.remove(&msg.chat.id);
+            state
+                .bot
+                .send_message(msg.chat.id, "🆕 新会话已开始,之前的对话历史已清空。")
+                .await?;
+            return Ok(());
+        }
+    }
+
+    // 构建发给模型的用户消息:纯文本,或图片(可带说明文字)
+    let Some(user_msg) = build_user_message(&state.bot, &msg).await? else {
         state
             .bot
-            .send_message(msg.chat.id, "请发送文本消息 🙏")
+            .send_message(msg.chat.id, "请发送文本消息或图片 🙏")
             .await?;
         return Ok(());
     };
-
-    // 简单的 /start、/help、/new 命令
-    if text.starts_with("/start") || text.starts_with("/help") {
-        state
-            .bot
-            .send_message(
-                msg.chat.id,
-                "👋 我是 ying!直接发文本就行。\n\
-                 我可以用 `bash` 跑命令,\
-                 每次调用工具前都会发按钮请你明确同意。\n\
-                 发送 /new 可以开启新会话(清空对话历史)。",
-            )
-            .await?;
-        return Ok(());
-    }
-    if text.starts_with("/new") {
-        let mut map = state.histories.lock().await;
-        map.remove(&msg.chat.id);
-        state
-            .bot
-            .send_message(msg.chat.id, "🆕 新会话已开始,之前的对话历史已清空。")
-            .await?;
-        return Ok(());
-    }
 
     tracing::info!(
         "收到消息: chat={} user={:?} text={:?}",
@@ -79,7 +249,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         map.get(&chat_id).cloned().unwrap_or_default()
     };
 
-    match agent.chat(text, &mut history).await {
+    match agent.chat(user_msg, &mut history).await {
         Ok(reply) => {
             tracing::info!(
                 "Agent 回复完成: chat={} 共 {} 轮历史",
@@ -221,4 +391,51 @@ pub async fn on_callback(state: AppState, q: CallbackQuery) -> HandlerResult {
 
     let _ = state.bot.answer_callback_query(q.id.clone()).await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一张高频噪点图,保证高质 JPEG 编码后远超 256KB。
+    fn noisy_jpeg(w: u32, h: u32, quality: u8) -> Vec<u8> {
+        let mut img = image::RgbImage::new(w, h);
+        for (x, y, px) in img.enumerate_pixels_mut() {
+            let v = (((x as u64) ^ (y as u64).wrapping_mul(2654435761)) % 256) as u8;
+            *px = image::Rgb([v, v.wrapping_add(1), v.wrapping_add(2)]);
+        }
+        let mut buf = Vec::new();
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
+            .encode_image(&img)
+            .unwrap();
+        buf
+    }
+
+    #[test]
+    fn large_image_compressed_under_limit() {
+        let orig = noisy_jpeg(1200, 1200, 95);
+        assert!(
+            orig.len() > MAX_IMAGE_BYTES,
+            "测试图应超 256KB,实际 {}B",
+            orig.len()
+        );
+
+        let (out, mt) = compress_image(orig, ImageMediaType::JPEG);
+        assert!(
+            out.len() <= MAX_IMAGE_BYTES,
+            "压缩后 {}B 仍超 256KB",
+            out.len()
+        );
+        assert!(matches!(mt, ImageMediaType::JPEG));
+        // 结果仍是合法图片
+        assert!(image::load_from_memory(&out).is_ok());
+    }
+
+    #[test]
+    fn small_image_passes_through_unchanged() {
+        let small = b"tiny-bytes-well-under-limit".to_vec();
+        let (out, mt) = compress_image(small.clone(), ImageMediaType::PNG);
+        assert_eq!(out, small);
+        assert!(matches!(mt, ImageMediaType::PNG));
+    }
 }
