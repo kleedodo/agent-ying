@@ -239,10 +239,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     let chat_id = msg.chat.id;
     let agent = state.agent_for(chat_id);
 
-    state
-        .bot
-        .send_message(chat_id, "🤔 思考中…(调用工具时会发按钮请你确认)")
-        .await?;
+    state.bot.send_message(chat_id, "🤔 思考中…").await?;
 
     // 每个 chat 单独维护多轮对话历史(先取出再写回)
     let mut history: Vec<RigMessage> = {
