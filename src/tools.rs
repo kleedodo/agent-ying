@@ -1,6 +1,8 @@
 //! rig 工具:bash、send_file。
 //! 每个工具执行前都会先通过 Telegram 内联按钮请用户明确同意。
 
+use std::path::{Path, PathBuf};
+
 use rig::tool::Tool;
 use serde::Deserialize;
 use teloxide::prelude::*;
@@ -59,7 +61,7 @@ impl Tool for Bash {
     type Output = String;
 
     fn description(&self) -> String {
-        "在 shell 中执行一条 bash 命令,返回 stdout 和 stderr。".into()
+        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -137,6 +139,92 @@ impl Tool for Bash {
                 ))
             }
         }
+    }
+}
+
+//-------------------------------------------------------------- read_skill
+
+/// read_skill 输出上限:128K 字符
+const MAX_READ_SKILL_CHARS: usize = 128 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct ReadSkillArgs {
+    /// 要读取的文件路径(绝对路径,或相对于 skills 目录)
+    pub path: String,
+}
+
+/// 只读 skills 根目录下的文件,只读无副作用,免审批。
+#[derive(Clone)]
+pub struct ReadSkill(pub PathBuf);
+
+impl std::fmt::Debug for ReadSkill {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadSkill").finish()
+    }
+}
+
+impl Tool for ReadSkill {
+    const NAME: &'static str = "read_skill";
+
+    type Error = ToolErr;
+    type Args = ReadSkillArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        format!(
+            "读取 skills 目录({})下的文件，如 SKILL.md 或它的附属文件",
+            self.0.display()
+        )
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要读取的文件路径(绝对路径,或相对于 skills 目录)"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let root = tokio::fs::canonicalize(&self.0)
+            .await
+            .map_err(|e| ToolErr(format!("skills 目录 {} 不存在: {e}", self.0.display())))?;
+
+        let requested = if Path::new(&args.path).is_absolute() {
+            PathBuf::from(&args.path)
+        } else {
+            self.0.join(&args.path)
+        };
+        let target = tokio::fs::canonicalize(&requested)
+            .await
+            .map_err(|e| ToolErr(format!("读取文件 `{}` 失败: {e}", args.path)))?;
+
+        // canonicalize 后检查前缀,防止 ../ 逃逸出 skills 目录
+        if !target.starts_with(&root) {
+            return Err(ToolErr(format!(
+                "`{}` 不在 skills 目录 {} 下",
+                args.path,
+                root.display()
+            )));
+        }
+
+        let content = tokio::fs::read_to_string(&target)
+            .await
+            .map_err(|e| ToolErr(format!("读取文件 `{}` 失败: {e}", args.path)))?;
+
+        let truncated = if content.chars().count() <= MAX_READ_SKILL_CHARS {
+            content
+        } else {
+            let mut out: String = content.chars().take(MAX_READ_SKILL_CHARS).collect();
+            out.push_str("\n…(已截断)");
+            out
+        };
+        Ok(truncated)
     }
 }
 

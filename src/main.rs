@@ -1,6 +1,7 @@
 mod approval;
 mod config;
 mod handlers;
+mod skills;
 mod tools;
 
 use std::collections::HashMap;
@@ -14,11 +15,14 @@ use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatId, UpdateKind, UserId};
 use tokio::sync::Mutex;
 
+use std::path::PathBuf;
+
 use approval::ApprovalManager;
 use config::Config;
 use handlers::{on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
-use tools::{Bash, SendFile, ToolCtx};
+use skills::Skills;
+use tools::{Bash, ReadSkill, SendFile, ToolCtx};
 
 // 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
 #[global_allocator]
@@ -42,6 +46,7 @@ struct AppState {
     temperature: f64,
     max_turns: usize,
     max_tokens: u64,
+    skills_dir: PathBuf,
 }
 
 impl AppState {
@@ -66,6 +71,7 @@ impl AppState {
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
             .tool(SendFile(ctx))
+            .tool(ReadSkill(self.skills_dir.clone()))
             // 采样参数与最大轮数都从配置读取
             .temperature(self.temperature)
             .max_tokens(self.max_tokens)
@@ -128,7 +134,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             .build()?,
         _ => openai::CompletionsClient::new(config.openai_api_key.clone())?,
     };
-    let system_prompt = config.resolve_system_prompt();
+    // 加载 skills(固定目录 ~/.agent-ying/skills/),把索引拼到系统提示末尾
+    let skills = Skills::load(Config::skills_dir());
+    let mut system_prompt = config.resolve_system_prompt();
+    if let Some(block) = skills.render_block() {
+        system_prompt.push_str(&block);
+    }
+    tracing::info!("已加载 {} 个 skill", skills.skills.len());
 
     // 先清空已有的命令,再注册 /new,避免上次残留的命令
     bot.set_my_commands(Vec::<BotCommand>::new()).await?;
@@ -150,6 +162,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         temperature: config.temperature,
         max_turns: config.max_turns,
         max_tokens: config.max_tokens,
+        skills_dir: Config::skills_dir(),
     };
 
     let handler = build_handler();

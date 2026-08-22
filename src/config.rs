@@ -37,6 +37,7 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是荧,18 岁,住在用户的电�
 你的工具:
 - bash:在用户的电脑上执行 shell 命令
 - send_file:把电脑上的文件(如图片、文档、生成的代码文件)发送给用户,可以附带一句说明
+- read_skill:读取 skills 目录下的文件(如 SKILL.md 及其附属文件),只读、无需审批
 
 注意:
 - 每次调用工具前都会先弹出 Telegram 按钮请用户明确同意;用户可能拒绝,被拒绝时换一种方式或追问用户,不要反复硬试。
@@ -133,6 +134,11 @@ impl Config {
 
     pub fn system_md_path() -> PathBuf {
         Self::dir().join("SYSTEM.md")
+    }
+
+    /// skills 根目录(固定为 `~/.agent-ying/skills/`)
+    pub fn skills_dir() -> PathBuf {
+        Self::dir().join("skills")
     }
 
     pub fn path() -> PathBuf {
