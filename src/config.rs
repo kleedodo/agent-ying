@@ -63,9 +63,6 @@ pub struct Config {
     pub name: String,
     /// 模型名,如 gpt-5-mini、gpt-5
     pub model: String,
-    /// 系统提示;不写入模板。优先级最低,若 `~/.agent-ying/SYSTEM.md` 存在则用其内容覆盖
-    #[serde(default, skip_serializing)]
-    pub system_prompt: Option<String>,
     /// bash 工具超时(秒)
     pub bash_timeout_secs: u64,
     /// 审批等待超时(秒),超过则按拒绝处理
@@ -93,7 +90,6 @@ impl Default for Config {
             openai_base_url: None,
             name: DEFAULT_NAME.to_string(),
             model: DEFAULT_MODEL.to_string(),
-            system_prompt: None,
             bash_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             allowed_user_ids: Vec::new(),
@@ -171,18 +167,15 @@ impl Config {
     }
 
     /// 解析最终系统提示,优先级从高到低:
-    /// 1. `~/.agent-ying/SYSTEM.md`(存在则用其内容覆盖)
-    /// 2. `config.json` 的 `system_prompt`
-    /// 3. 代码内默认值
+    /// 1. `~/.agent-ying/SYSTEM.md`(存在则用其内容)
+    /// 2. 代码内默认值
     pub fn resolve_system_prompt(&self) -> String {
         let md = Self::system_md_path();
         let prompt = if let Ok(content) = fs::read_to_string(&md) {
             tracing::info!("系统提示词使用 {}", md.display());
             content
         } else {
-            self.system_prompt
-                .clone()
-                .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string())
+            DEFAULT_SYSTEM_PROMPT.to_string()
         };
         // 把 {{char}} 占位符替换为 agent 配置的真实名字
         if prompt.contains("{{char}}") {
@@ -203,30 +196,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_system_prompt_replaces_all_char_placeholders() {
+    fn resolve_system_prompt_falls_back_to_default_with_char_replaced() {
         if has_system_md() {
             eprintln!("跳过: 存在 {}", Config::system_md_path().display());
             return;
         }
         let cfg = Config {
             name: "阿绿".into(),
-            system_prompt: Some("你是{{char}}，用户叫你{{char}}。".into()),
             ..Default::default()
         };
-        assert_eq!(cfg.resolve_system_prompt(), "你是阿绿，用户叫你阿绿。");
-    }
-
-    #[test]
-    fn resolve_system_prompt_without_placeholder_unchanged() {
-        if has_system_md() {
-            eprintln!("跳过: 存在 {}", Config::system_md_path().display());
-            return;
-        }
-        let cfg = Config {
-            name: "阿绿".into(),
-            system_prompt: Some("一段固定提示词".into()),
-            ..Default::default()
-        };
-        assert_eq!(cfg.resolve_system_prompt(), "一段固定提示词");
+        assert_eq!(
+            cfg.resolve_system_prompt(),
+            DEFAULT_SYSTEM_PROMPT.replace("{{char}}", "阿绿")
+        );
     }
 }

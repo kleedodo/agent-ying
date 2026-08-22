@@ -70,9 +70,8 @@ cargo run --release
 
 按优先级从高到低:
 
-1. `~/.agent-ying/SYSTEM.md`(存在则用其内容覆盖)
-2. `config.json` 的 `system_prompt` 字段
-3. 代码内默认人设(「荧」:18 岁、住在用户电脑里的女朋友)
+1. `~/.agent-ying/SYSTEM.md`(存在则用其内容)
+2. 代码内默认人设(「荧」:18 岁、住在用户电脑里的女朋友)
 
 ## 项目结构
 
