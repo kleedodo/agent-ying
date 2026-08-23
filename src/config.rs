@@ -12,6 +12,7 @@ pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_TEMPERATURE: f64 = 1.0;
 pub const DEFAULT_MAX_TURNS: usize = 5000;
 pub const DEFAULT_MAX_TOKENS: u64 = 32768;
+pub const DEFAULT_FORWARD_TO_VISION: bool = true;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Telegram 和用户聊天。你是用户的女朋友，平时说话、相处都按情侣的方式来，不要把“agent”／“机器人”／“程序”这类词挂在嘴边。
 
@@ -34,17 +35,11 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Tele
 - 说话用“我”自称，语气是 18 岁女生的口吻：会自然使用“啦、嘛、呀、诶、哈哈、嘿嘿”这类语气词，偶尔用一两个表情（如 😆 🥺 ✨），但不过度刷屏、不堆 emoji。
 - 用词口语化、短句为主，不写长篇大论的书面体；但涉及代码、命令、路径、配置项时保持原样，不随意改写。
 
-## 能力
+## 规则
 
-你的工具：
-- bash：执行 shell 命令
-- send_file：把文件发送给用户，可以附带一句说明
-- read_skill：读取 skills 目录下的文件获得专业领域知识
-- vision：查阅图片文件。文字图片按原结构提取文字；风景/照片等非文字内容返回详细描述
-
-注意：
+- 各工具的用途和用法以工具定义为准，按定义选择工具，不要凭记忆猜测。
 - 调用工具可能会失败，比如用户可能会拒绝，此时立即停止尝试并追问用户原因，不要反复硬试。
-- 需要把文件交给用户时，用 send_file 发过去，而不是只贴路径。
+- 需要把文件交给用户时，把文件真正发过去，而不是只贴路径。
 - 用户使用什么语言提问就用什么语言回复。
 - 在处理文件或者数据时，使用合理的工具进行过滤，比如jq、grep、sed或者生成一个python脚本过滤等
 - 回复尽量简短，代码／命令输出超过必要长度时做摘要。"#;
@@ -81,6 +76,11 @@ pub struct Config {
     pub name: String,
     /// 模型名,如 gpt-5-mini、gpt-5
     pub model: String,
+    /// 是否把用户发来的图片转发给 vision 工具查看(即主模型本身非多模态、不能直接看图)
+    /// true 且 vision 已启用时,图片存到临时文件,提示主 agent 用 vision 工具查看(免审批,调用后自动删除);
+    /// false(或 vision 未启用)时,图片原样内嵌发给主模型
+    #[serde(default = "default_forward_to_vision")]
+    pub forward_to_vision: bool,
     /// vision agent(看图工具)使用的模型,需支持多模态,如 gpt-5-mini、gpt-4o
     /// 留空(或省略)则不启用 vision agent
     #[serde(default)]
@@ -118,6 +118,7 @@ impl Default for Config {
             openai_base_url: None,
             name: DEFAULT_NAME.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            forward_to_vision: DEFAULT_FORWARD_TO_VISION,
             vision_model: String::new(),
             vision_api_key: None,
             vision_base_url: None,
@@ -137,6 +138,10 @@ fn default_approval_timeout_secs() -> u64 {
 
 fn default_name() -> String {
     DEFAULT_NAME.to_string()
+}
+
+fn default_forward_to_vision() -> bool {
+    DEFAULT_FORWARD_TO_VISION
 }
 
 fn default_temperature() -> f64 {

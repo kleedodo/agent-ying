@@ -7,13 +7,13 @@
 ## 功能
 
 - **Telegram 聊天机器人**:通过 teloxide 接收消息,同一会话内消息串行处理,保持上下文
-- **多模态输入**:用户发的图片会先压缩到 256KB 以下,再以 data URL 形式喂给多模态模型
+- **多模态输入**:用户发的图片会先压缩到 256KB 以下,再以 data URL 形式直接喂给主模型;`forward_to_vision: true`(默认,主模型非多模态时)且 vision 已启用时,图片会存到临时文件并转发给 vision 工具查看(免审批,调用结束后自动删除);vision 未启用时图片仍原样内嵌发给主模型
 - **工具调用**:
   - `bash`:在用户的电脑上执行 shell 命令(可配置超时,输出超长自动截断)
   - `send_file`:把电脑上的文件(图片、文档、生成的代码等)发送给用户
   - `read_skill`:读取 skills 目录下的技能文件(如 SKILL.md 及其附属文件),只读、无需审批
   - `vision`:看图工具——文字图(截图/文档/代码)按原结构提取文字,风景/照片等非文字内容详细描述;由独立的多模态 agent 驱动,可单独配置模型 / API key / base URL,`vision_model` 留空则不启用
-- **按钮审批**：每次调用工具前都会弹出 Telegram 内联按钮，用户点「同意」才执行；超时未点按拒绝处理
+- **按钮审批**：每次调用工具前都会弹出 Telegram 内联按钮，用户点「同意」才执行；超时未点按拒绝处理。例外:用户发图转发给 vision 查看时免审批(发图即视为同意)
 - **用户白名单**:可配置只响应指定的 Telegram user id
 - **会话管理**:`/new` 命令清空当前对话历史,开启新会话
 - **可定制人设**:系统提示词支持三级覆盖(见下文)
@@ -37,6 +37,7 @@ cargo build --release
   "openai_base_url": "https://openrouter.ai/api/v1",
   "name": "荧",
   "model": "gpt-5-mini",
+  "forward_to_vision": true,
   "vision_model": "gpt-5-mini",
   "vision_api_key": "sk-...",
   "vision_base_url": "https://openrouter.ai/api/v1",
@@ -56,7 +57,8 @@ cargo build --release
 | `openai_base_url` | OpenAI 兼容服务的 base URL,留空则用官方 `https://api.openai.com/v1` |
 | `name` | agent 名字,默认「荧」 |
 | `model` | 模型名,如 `gpt-5-mini`、`gpt-5` |
-| `vision_model` | 看图工具(vision)用的模型,需支持多模态;**留空(或省略)则不启用 vision agent** |
+| `forward_to_vision` | 是否把用户发来的图片转发给 vision 工具(即主模型本身非多模态、不能直接看图),默认 `true`;为 `true` 且 vision 已启用时,图片存到临时文件(`$TMPDIR/agent-ying/`),由主 agent 调 vision 工具查看(免审批,调用结束后自动删除);为 `false` 或 vision 未启用时图片原样内嵌发给主模型 |
+| `vision_model` | 看图工具(vision)用的模型,需支持多模态;**留空(或省略)则不启用 vision agent**。注意:`forward_to_vision: true`(默认)时建议启用,否则用户发来的图片会原样发给主模型(主模型可能看不到) |
 | `vision_api_key` | vision 专用 API key,留空则回退到 `openai_api_key` |
 | `vision_base_url` | vision 专用 base URL,留空则回退到 `openai_base_url`(再留空用官方 `https://api.openai.com/v1`) |
 | `bash_timeout_secs` | bash 工具执行超时(秒),默认 60 |

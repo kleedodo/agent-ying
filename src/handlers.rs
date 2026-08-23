@@ -1,5 +1,7 @@
 //! Telegram 更新处理器:文本消息 → 跑 agent;按钮回调 → 决定工具审批。
 
+use std::path::{Path, PathBuf};
+
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use rig::OneOrMany;
@@ -15,32 +17,108 @@ use crate::{AppState, approval::approval_body};
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
+/// 用户发来的图片的临时目录:`$TMPDIR/agent-ying/`
+pub(crate) fn temp_image_dir() -> PathBuf {
+    std::env::temp_dir().join("agent-ying")
+}
+
+/// 判断路径是否位于临时图片目录内(vision 工具据此免审批并在调用后自动删除)
+pub(crate) fn is_temp_image_path(path: &str) -> bool {
+    Path::new(path).starts_with(temp_image_dir())
+}
+
+/// 把用户发来的图片存为临时文件,命名 `<chat_id>-<消息 id>.<ext>`
+async fn save_temp_image(
+    msg: &Message,
+    bytes: &[u8],
+    ext: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let dir = temp_image_dir();
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir.join(format!("{}-{}.{}", msg.chat.id.0, msg.id, ext));
+    tokio::fs::write(&path, bytes).await?;
+    tracing::info!("用户发来的图片已存到临时文件: {}", path.display());
+    Ok(path)
+}
+
+/// 转发给 vision 时,图片对应的用户消息:
+/// 告诉主 agent 图片已存到哪个临时文件,请它调用 vision 工具查看。
+fn temp_image_text_message(caption: String, path: PathBuf) -> RigMessage {
+    let text = if caption.trim().is_empty() {
+        format!(
+            "用户发来一张图片,已保存到 {},请用 vision 工具查看它。",
+            path.display()
+        )
+    } else {
+        format!(
+            "用户发来一张图片并附说明「{}」,图片已保存到 {},请用 vision 工具查看它。",
+            caption,
+            path.display()
+        )
+    };
+    RigMessage::User {
+        content: OneOrMany::one(UserContent::Text(RigText {
+            text,
+            additional_params: None,
+        })),
+    }
+}
+
+/// 把 rig 的图片类型映射为临时文件扩展名(压缩可能改变格式,扩展名以压缩后的 media type 为准)。
+fn ext_for_media_type(mt: ImageMediaType) -> &'static str {
+    match mt {
+        ImageMediaType::JPEG => "jpg",
+        ImageMediaType::PNG => "png",
+        ImageMediaType::GIF => "gif",
+        ImageMediaType::WEBP => "webp",
+        ImageMediaType::HEIC => "heic",
+        ImageMediaType::HEIF => "heif",
+        ImageMediaType::SVG => "svg",
+    }
+}
+
 /// 从 Telegram 消息构建发给模型的用户消息。
 /// 支持:图片(photo,或 image/* 的 document,可带说明文字)、纯文本。
+/// `forward_to_vision` 为 true 时,图片存到临时文件,
+/// 用文本提示主 agent 调 vision 工具;否则图片直接内嵌、原样发给上游。
 /// 返回 None 表示既不是文本也不是受支持的图片(如贴纸、视频等)。
 async fn build_user_message(
     bot: &Bot,
     msg: &Message,
+    forward_to_vision: bool,
 ) -> Result<Option<RigMessage>, Box<dyn std::error::Error + Send + Sync>> {
     // 1. 图片:photo 优先(总是 JPEG),其次 image/* 的 document
-    if let Some(photo) = msg.photo().as_ref().and_then(|photos| photos.last()) {
+    // Telegram 的 photo 带多档尺寸,取宽度 ≤1080 的最大档省流量;没有则退回最大档
+    if let Some(photos) = msg.photo().as_ref()
+        && let Some(photo) = photos.iter().rev().find(|p| p.width <= 1080).or_else(|| photos.last())
+    {
         let bytes = download_file_bytes(bot, &photo.file.id).await?;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        return Ok(Some(image_user_message(
-            caption,
-            bytes,
-            ImageMediaType::JPEG,
-        )));
+        if !forward_to_vision {
+            return Ok(Some(image_user_message(
+                caption,
+                bytes,
+                ImageMediaType::JPEG,
+            )));
+        }
+        // 先压缩再存临时文件,vision 看图时就不用再压缩
+        let (bytes, media_type) = compress_image(bytes, ImageMediaType::JPEG);
+        let path = save_temp_image(msg, &bytes, ext_for_media_type(media_type)).await?;
+        return Ok(Some(temp_image_text_message(caption, path)));
     }
     if let Some(doc) = msg.document().as_ref()
-        && let Some(media_type) = doc
-            .mime_type
-            .as_ref()
-            .and_then(|mime| mime_to_image_media_type(mime.as_ref()))
+        && let Some(mime) = doc.mime_type.as_ref()
+        && let Some(media_type) = mime_to_image_media_type(mime.as_ref())
     {
         let bytes = download_file_bytes(bot, &doc.file.id).await?;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        return Ok(Some(image_user_message(caption, bytes, media_type)));
+        if !forward_to_vision {
+            return Ok(Some(image_user_message(caption, bytes, media_type)));
+        }
+        // 先压缩再存临时文件,vision 看图时就不用再压缩
+        let (bytes, media_type) = compress_image(bytes, media_type);
+        let path = save_temp_image(msg, &bytes, ext_for_media_type(media_type)).await?;
+        return Ok(Some(temp_image_text_message(caption, path)));
     }
 
     // 2. 纯文本
@@ -224,7 +302,10 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     }
 
     // 构建发给模型的用户消息:纯文本,或图片(可带说明文字)
-    let Some(user_msg) = build_user_message(&state.bot, &msg).await? else {
+    // forward_to_vision 且 vision 已启用时,图片转存临时文件并提示调 vision 工具;
+    // 否则(包括 vision 未启用的情况)图片原样内嵌发给上游
+    let forward_to_vision = state.forward_to_vision && state.vision_client.is_some();
+    let Some(user_msg) = build_user_message(&state.bot, &msg, forward_to_vision).await? else {
         state
             .bot
             .send_message(msg.chat.id, "请发送文本消息或图片 🙏")
@@ -418,14 +499,14 @@ mod tests {
         assert!(
             orig.len() > MAX_IMAGE_BYTES,
             "测试图应超 256KB,实际 {}",
-            crate::tools::human_size(orig.len())
+            crate::tools::human_size(orig.len() as u64)
         );
 
         let (out, mt) = compress_image(orig, ImageMediaType::JPEG);
         assert!(
             out.len() <= MAX_IMAGE_BYTES,
             "压缩后 {} 仍超 256KB",
-            crate::tools::human_size(out.len())
+            crate::tools::human_size(out.len() as u64)
         );
         assert!(matches!(mt, ImageMediaType::JPEG));
         // 结果仍是合法图片

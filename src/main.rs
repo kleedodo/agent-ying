@@ -39,6 +39,8 @@ struct AppState {
     histories: Arc<Mutex<HashMap<ChatId, Vec<Message>>>>,
     name: String,
     model: String,
+    /// 是否把用户发来的图片转发给 vision 工具;true 且 vision 已启用时,图片存临时文件并转发
+    forward_to_vision: bool,
     vision_model: String,
     /// None 表示 vision_model 留空、未启用 vision agent
     vision_client: Option<openai::CompletionsClient>,
@@ -167,6 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     } else {
         tracing::info!("vision agent 未启用(vision_model 留空)");
     }
+    if config.forward_to_vision && !vision_enabled {
+        tracing::warn!(
+            "forward_to_vision=true 但 vision agent 未启用(vision_model 留空),用户发来的图片将原样内嵌发给主模型(主模型可能看不到)"
+        );
+    }
 
     let bot = Bot::new(config.telegram_bot_token.clone());
     // 主 agent 客户端:自定义 OpenAI 兼容 base_url(留空则用官方地址)
@@ -211,6 +218,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         histories: Arc::new(Mutex::new(HashMap::new())),
         name: config.name,
         model: config.model,
+        forward_to_vision: config.forward_to_vision,
         vision_model: config.vision_model,
         vision_client,
         vision_system_prompt,
