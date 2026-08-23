@@ -11,6 +11,7 @@
 - **工具调用**:
   - `bash`:在用户的电脑上执行 shell 命令(可配置超时,输出超长自动截断)
   - `send_file`:把电脑上的文件(图片、文档、生成的代码等)发送给用户
+  - `read_skill`:读取 skills 目录下的技能文件(如 SKILL.md 及其附属文件),只读、无需审批
 - **按钮审批**:每次调用工具前都会弹出 Telegram 内联按钮,用户点「同意」才执行;超时未点按拒绝处理
 - **用户白名单**:可配置只响应指定的 Telegram user id
 - **会话管理**:`/new` 命令清空当前对话历史,开启新会话
@@ -73,6 +74,38 @@ cargo run --release
 1. `~/.agent-ying/SYSTEM.md`(存在则用其内容)
 2. 代码内默认人设(「荧」:18 岁、住在用户电脑里的女朋友)
 
+## 技能(Skills)
+
+技能用于给 agent 提供特定任务的专门指令,采用渐进式披露:启动时只把每个技能的 name + description 拼进系统提示,模型判断任务匹配某个技能时,再用 `read_skill` 工具读取完整的 SKILL.md。
+
+### 配置方法
+
+1. 在 `~/.agent-ying/skills/` 下为每个技能建一个子目录,并放入 `SKILL.md`:
+
+   ```
+   ~/.agent-ying/skills/
+   └── gitmoji/
+       ├── SKILL.md
+       └── references/gitmoji-reference.md   # 附属文件可选
+   ```
+
+2. `SKILL.md` 开头用 YAML frontmatter 声明 `name` 和 `description`(description 是模型判断是否使用该技能的关键):
+
+   ```markdown
+   ---
+   name: gitmoji
+   description: 按 gitmoji 规范生成 commit message
+   ---
+
+   # Gitmoji
+   具体指令正文……
+   ```
+
+   没有 frontmatter 或缺字段时,name 回退为目录名,description 留空。
+3. 重启后生效:启动时扫描 `~/.agent-ying/skills/*/SKILL.md`,把技能索引追加到系统提示末尾;没有技能则不追加。
+
+技能文件里引用相对路径时,以技能目录(SKILL.md 的父目录)为基准解析;`read_skill` 只读、免审批,且防止 `../` 逃逸出 skills 目录。
+
 ## 项目结构
 
 ```
@@ -80,7 +113,8 @@ src/
 ├── main.rs      # 入口:配置加载、agent 构建、dptree handler 注册
 ├── config.rs    # ~/.agent-ying/config.json 的加载与默认模板
 ├── handlers.rs  # Telegram 消息 / 按钮回调处理
-├── tools.rs     # rig 工具:bash、send_file
+├── tools.rs     # rig 工具:bash、send_file、read_skill
+├── skills.rs    # 扫描 ~/.agent-ying/skills/,生成系统提示里的技能索引
 └── approval.rs  # 工具执行前的 Telegram 按钮审批
 ```
 
