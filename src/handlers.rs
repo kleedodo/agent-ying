@@ -417,15 +417,15 @@ mod tests {
         let orig = noisy_jpeg(1200, 1200, 95);
         assert!(
             orig.len() > MAX_IMAGE_BYTES,
-            "测试图应超 256KB,实际 {}B",
-            orig.len()
+            "测试图应超 256KB,实际 {}",
+            crate::tools::human_size(orig.len())
         );
 
         let (out, mt) = compress_image(orig, ImageMediaType::JPEG);
         assert!(
             out.len() <= MAX_IMAGE_BYTES,
-            "压缩后 {}B 仍超 256KB",
-            out.len()
+            "压缩后 {} 仍超 256KB",
+            crate::tools::human_size(out.len())
         );
         assert!(matches!(mt, ImageMediaType::JPEG));
         // 结果仍是合法图片

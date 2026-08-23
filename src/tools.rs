@@ -238,6 +238,19 @@ impl Tool for ReadSkill {
     }
 }
 
+/// 把字节数格式化为人类可读的大小(如 `512B`、`1.2MB`)。
+pub fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    match bytes {
+        b if b < 1024 => format!("{b}B"),
+        b if b < MB as u64 => format!("{:.1}KB", b as f64 / KB),
+        b if b < GB as u64 => format!("{:.1}MB", b as f64 / MB),
+        b => format!("{:.1}GB", b as f64 / GB),
+    }
+}
+
 // ----------------------------------------------------------------- send_file
 
 /// Telegram Bot API 上传大小上限:50MB。
@@ -300,9 +313,9 @@ impl Tool for SendFile {
         }
         if metadata.len() > MAX_SEND_BYTES {
             return Err(ToolErr(format!(
-                "文件 `{}` 大小 {}B 超过 Telegram 上传上限 50MB",
+                "文件 `{}` 大小 {} 超过 Telegram 上传上限 50MB",
                 args.path,
-                metadata.len()
+                human_size(metadata.len())
             )));
         }
 
@@ -312,7 +325,7 @@ impl Tool for SendFile {
             &ctx.approvals,
             ctx.approval_timeout,
             "send_file",
-            &format!("发送文件:`{}`({}B)", args.path, metadata.len()),
+            &format!("发送文件:`{}`({})", args.path, human_size(metadata.len())),
         )
         .await
         .map_err(ToolErr)?;
@@ -338,9 +351,9 @@ impl Tool for SendFile {
 
         match req.await {
             Ok(_) => Ok(format!(
-                "文件 `{}` 已发送给用户({}B)。",
+                "文件 `{}` 已发送给用户({})。",
                 args.path,
-                metadata.len()
+                human_size(metadata.len())
             )),
             Err(e) => Err(ToolErr(format!("发送文件 `{}` 失败: {e}", args.path))),
         }
@@ -440,7 +453,7 @@ impl Tool for Vision {
             &ctx.approvals,
             ctx.approval_timeout,
             "vision",
-            &format!("看图:`{}`({}B)", args.path, metadata.len()),
+            &format!("看图:`{}`({})", args.path, human_size(metadata.len())),
         )
         .await
         .map_err(ToolErr)?;
