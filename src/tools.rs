@@ -92,7 +92,11 @@ impl Tool for Bash {
         })
     }
 
-    async fn call(&self, _context: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.0;
         let approved = request_approval(
             &ctx.bot,
@@ -205,7 +209,11 @@ impl Tool for ReadSkill {
         })
     }
 
-    async fn call(&self, _context: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let root = tokio::fs::canonicalize(&self.0)
             .await
             .map_err(|e| ToolErr(format!("skills 目录 {} 不存在: {e}", self.0.display())))?;
@@ -306,7 +314,11 @@ impl Tool for SendFile {
         })
     }
 
-    async fn call(&self, _context: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.0;
 
         // 先检查文件存在性和大小,避免审批通过后才发现发不出去
@@ -410,7 +422,10 @@ fn build_inbox_name(date: i64, message_id: u64, file: &IncomingFile) -> (String,
     let (ts, month) = match chrono::DateTime::<chrono::Utc>::from_timestamp(date, 0) {
         Some(d) => {
             let d = d.with_timezone(&chrono::Local);
-            (d.format("%Y%m%d_%H%M%S").to_string(), d.format("%Y-%m").to_string())
+            (
+                d.format("%Y%m%d_%H%M%S").to_string(),
+                d.format("%Y-%m").to_string(),
+            )
         }
         None => (date.to_string(), "unknown".to_string()),
     };
@@ -470,7 +485,11 @@ impl Tool for SaveIncoming {
         })
     }
 
-    async fn call(&self, _context: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.0;
 
         // 1. 按消息 ID 查缓存拿文件元数据(消息进来时已记下,不下载本体)
@@ -674,7 +693,11 @@ impl Tool for Vision {
         })
     }
 
-    async fn call(&self, _context: &mut ToolContext, args: Self::Args) -> Result<Self::Output, Self::Error> {
+    async fn call(
+        &self,
+        _context: &mut ToolContext,
+        args: Self::Args,
+    ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.ctx;
         // 临时目录里的图片是「用户刚发来的图」(主模型非多模态时被转发过来):
         // 用户发图即视为同意看图,免审批;调用结束后(无论成败)自动删除

@@ -85,8 +85,8 @@ fn ext_for_media_type(mt: ImageMediaType) -> &'static str {
 /// 支持:图片(photo,或 image/* 的 document,可带说明文字)、文档、视频、音频、纯文本。
 /// 图片:`forward_to_vision` 为 true 时存到临时文件并用文本提示主 agent 调 vision 工具;
 /// 否则直接内嵌、原样发给上游。
-/// 文档/视频/音频只把元数据(文件名、大小、消息 ID)以文本形式告诉主 agent,
-/// 不下载文件本体;用户明确要求保存时由 agent 调 save_incoming 工具原样下载。
+/// 文档/视频/音频只把元数据(文件名、大小、消息 ID,以及说明文字 caption)以文本形式
+/// 告诉主 agent,不下载文件本体;用户明确要求保存时由 agent 调 save_incoming 工具原样下载。
 /// 所有文件类消息的文本里都会带上消息 ID,供 save_incoming 定位。
 /// 返回 None 表示既不是文本也不是受支持的文件类型(如贴纸等)。
 async fn build_user_message(
@@ -147,24 +147,32 @@ async fn build_user_message(
             .clone()
             .unwrap_or_else(|| "未知文件".to_string());
         let size = crate::tools::human_size(doc.file.size as u64);
-        return Ok(Some(text_user_message(format!(
-            "用户发来一个文档 `{name}`(MIME: {mime},大小 {size},消息 ID {msg_id})"
+        let caption = msg.caption().map(str::to_string).unwrap_or_default();
+        return Ok(Some(text_user_message(with_caption(
+            format!("用户发来一个文档 `{name}`(MIME: {mime},大小 {size},消息 ID {msg_id})"),
+            &caption,
         ))));
     }
     // 2. 视频 / 音频:同样只传元数据
     if let Some(v) = msg.video() {
         let name = v.file_name.clone().unwrap_or_else(|| "视频".to_string());
         let size = crate::tools::human_size(v.file.size as u64);
-        return Ok(Some(text_user_message(format!(
-            "用户发来一个视频 `{name}`(大小 {size},时长 {}s,消息 ID {msg_id})",
-            v.duration.seconds()
+        let caption = msg.caption().map(str::to_string).unwrap_or_default();
+        return Ok(Some(text_user_message(with_caption(
+            format!(
+                "用户发来一个视频 `{name}`(大小 {size},时长 {}s,消息 ID {msg_id})",
+                v.duration.seconds()
+            ),
+            &caption,
         ))));
     }
     if let Some(a) = msg.audio() {
         let title = a.title.clone().unwrap_or_else(|| "音频".to_string());
         let size = crate::tools::human_size(a.file.size as u64);
-        return Ok(Some(text_user_message(format!(
-            "用户发来一段音频 `{title}`(大小 {size},消息 ID {msg_id})"
+        let caption = msg.caption().map(str::to_string).unwrap_or_default();
+        return Ok(Some(text_user_message(with_caption(
+            format!("用户发来一段音频 `{title}`(大小 {size},消息 ID {msg_id})"),
+            &caption,
         ))));
     }
 
@@ -174,6 +182,15 @@ async fn build_user_message(
     }
 
     Ok(None)
+}
+
+/// 若消息带说明文字(caption),按图片消息的格式附到文本末尾。
+fn with_caption(text: String, caption: &str) -> String {
+    if caption.trim().is_empty() {
+        text
+    } else {
+        format!("{text},并附说明「{caption}」")
+    }
 }
 
 /// 构造纯文本用户消息。
