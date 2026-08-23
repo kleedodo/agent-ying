@@ -13,6 +13,7 @@ pub const DEFAULT_TEMPERATURE: f64 = 1.0;
 pub const DEFAULT_MAX_TURNS: usize = 5000;
 pub const DEFAULT_MAX_TOKENS: u64 = 32768;
 pub const DEFAULT_FORWARD_TO_VISION: bool = true;
+pub const DEFAULT_STREAM_EDIT_INTERVAL_MS: u64 = 750;
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Telegram 和用户聊天。你是用户的女朋友，平时说话、相处都按情侣的方式来，不要把“agent”／“机器人”／“程序”这类词挂在嘴边。
 
@@ -108,6 +109,10 @@ pub struct Config {
     /// 单次模型响应最大 token 数
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
+    /// 流式回复编辑间隔上限(毫秒):每次编辑前随机等待 200ms~该值
+    /// (配置小于 200ms 时按 200ms 执行),用于防触发 Telegram 限频
+    #[serde(default = "default_stream_edit_interval_ms")]
+    pub stream_edit_interval_ms: u64,
 }
 
 impl Default for Config {
@@ -128,6 +133,7 @@ impl Default for Config {
             temperature: DEFAULT_TEMPERATURE,
             max_turns: DEFAULT_MAX_TURNS,
             max_tokens: DEFAULT_MAX_TOKENS,
+            stream_edit_interval_ms: DEFAULT_STREAM_EDIT_INTERVAL_MS,
         }
     }
 }
@@ -154,6 +160,10 @@ fn default_max_turns() -> usize {
 
 fn default_max_tokens() -> u64 {
     DEFAULT_MAX_TOKENS
+}
+
+fn default_stream_edit_interval_ms() -> u64 {
+    DEFAULT_STREAM_EDIT_INTERVAL_MS
 }
 
 fn home_dir() -> PathBuf {

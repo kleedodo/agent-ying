@@ -14,8 +14,10 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "chrono",
+ "futures",
  "image",
  "mimalloc",
+ "rand 0.10.2",
  "rig",
  "serde",
  "serde_json",

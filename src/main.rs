@@ -54,6 +54,8 @@ struct AppState {
     temperature: f64,
     max_turns: usize,
     max_tokens: u64,
+    /// 流式回复编辑间隔上限;实际每次编辑前随机等待 200ms~该值(小于 200ms 按 200ms)
+    stream_edit_interval: Duration,
     skills_dir: PathBuf,
 }
 
@@ -234,6 +236,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         temperature: config.temperature,
         max_turns: config.max_turns,
         max_tokens: config.max_tokens,
+        stream_edit_interval: Duration::from_millis(config.stream_edit_interval_ms),
         skills_dir: Config::skills_dir(),
     };
 

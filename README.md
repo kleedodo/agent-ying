@@ -17,7 +17,8 @@
 - **按钮审批**：每次调用工具前都会弹出 Telegram 内联按钮，用户点「同意」才执行；超时未点按拒绝处理。例外:用户发图转发给 vision 查看时免审批(发图即视为同意)
 - **用户白名单**:可配置只响应指定的 Telegram user id
 - **会话管理**:`/new` 命令清空当前对话历史,开启新会话
-- **可定制人设**:系统提示词支持三级覆盖(见下文)
+- **流式回复**:先发送「正在输入」状态,每轮首个文本到达时创建"🤔 思考中…"占位消息,模型流式输出时增量编辑刷新成回复正文;每次编辑前随机等待 200ms~`stream_edit_interval_ms`(防触发 Telegram 限频);模型发起工具调用时,中间文本定稿为「📝 …」消息,保证最终回复始终排在审批消息之后
+- **可定制人设**:系统提示词支持本地文件覆盖(见下文)
 
 ## 快速开始
 
@@ -47,7 +48,8 @@ cargo build --release
   "allowed_user_ids": [],
   "temperature": 1.0,
   "max_turns": 5000,
-  "max_tokens": 32768
+  "max_tokens": 32768,
+  "stream_edit_interval_ms": 750
 }
 ```
 
@@ -68,6 +70,7 @@ cargo build --release
 | `temperature` | 采样温度,默认 1.0 |
 | `max_turns` | agent 单次对话最大工具轮数,默认 5000 |
 | `max_tokens` | 单次模型响应最大 token 数,默认 32768 |
+| `stream_edit_interval_ms` | 流式回复编辑间隔上限(毫秒),默认 750;每次编辑前随机等待 200ms~该值(配置小于 200ms 时按 200ms 执行),用于防触发 Telegram 限频 |
 
 ### 3. 运行
 
@@ -83,6 +86,8 @@ cargo run --release
 
 1. `~/.agent-ying/SYSTEM.md`(存在则用其内容)
 2. 代码内默认人设(「荧」:18 岁、住在用户电脑里的女朋友)
+
+提示词中可以使用 `{{char}}` 占位符,会被自动替换为配置里的 `name`。
 
 vision agent(看图工具)有自己独立的系统提示词,同样支持覆盖:
 
@@ -140,6 +145,7 @@ src/
 - **rustls 全链路**:teloxide 关闭默认 native-tls,与 rig 统一走 rustls,方便静态链接
 - **mimalloc 全局分配器**:抗内存碎片,降低常驻内存,支持 musl 静态构建
 - **审批与消息并行分发**:teloxide 默认按 chat 串行处理 update,但审批按钮回调若也排队会死锁(等按钮 → 按钮等消息结束),因此 `callback_query` 走并行 worker,文本消息仍保持每 chat 串行
+- **流式多轮对话**:基于 rig 的 `stream_chat` + `MultiTurnStreamItem`,文本增量按随机间隔节流写入占位消息;最终回复正文与本轮新增历史均以 `FinalResponse` 为准,流中断时按已有预览兜底
 
 ## 开发
 

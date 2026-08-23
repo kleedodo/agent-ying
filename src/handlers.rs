@@ -4,16 +4,20 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
+use futures::StreamExt;
+use rig::agent::{PromptResponse, StreamingError};
+use rig::completion::Message as RigMessage;
 use rig::completion::message::{
     DocumentSourceKind, Image as RigImage, ImageMediaType, Text as RigText, UserContent,
 };
-use rig::completion::{Chat, Message as RigMessage};
+use rig::prelude::{MultiTurnStreamItem, StreamingChat};
+use rig::streaming::StreamedAssistantContent;
 use std::collections::VecDeque;
 use std::sync::Arc;
 
 use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{FileId, InlineKeyboardMarkup, MessageId};
+use teloxide::types::{ChatAction, FileId, InlineKeyboardMarkup, MessageId};
 use tokio::sync::Mutex;
 
 use crate::{AppState, approval::approval_body};
@@ -415,6 +419,19 @@ fn image_user_message(text: String, bytes: Vec<u8>, media_type: ImageMediaType) 
     RigMessage::User { content }
 }
 
+/// 计算下一次流式编辑前的随机等待时长:
+/// 在 `200ms ~ interval` 内均匀随机;`interval` 小于 200ms 时按 200ms 执行。
+fn random_edit_wait(interval: std::time::Duration) -> std::time::Duration {
+    use std::time::Duration;
+    const FLOOR: Duration = Duration::from_millis(200);
+    let ceiling = interval.max(FLOOR);
+    if ceiling == FLOOR {
+        return FLOOR;
+    }
+    let range_ms = ceiling.as_millis() as u64 - FLOOR.as_millis() as u64;
+    FLOOR + Duration::from_millis(rand::random::<u64>() % (range_ms + 1))
+}
+
 /// 处理用户发来的文本消息:跑一轮 agent 对话(带多轮历史)。
 pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     // 只响应配置里允许的用户
@@ -519,7 +536,17 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     let chat_id = msg.chat.id;
     let agent = state.agent_for(chat_id);
 
-    state.bot.send_message(chat_id, "🤔 思考中…").await?;
+    // 先发「正在输入」状态,让用户立刻有反馈;
+    // 占位消息改为每轮首个文本到达时懒创建(见下方 placeholder)
+    let _ = state
+        .bot
+        .send_chat_action(chat_id, ChatAction::Typing)
+        .await;
+
+    // 占位消息始终代表「当前正在生成的回复」:
+    // 每轮首个文本到达时创建,工具调用时定稿/删除,
+    // 这样最终回复始终位于所有工具审批消息之后,不会被「顶上去」
+    let mut placeholder: Option<MessageId> = None;
 
     // 每个 chat 单独维护多轮对话历史(先取出再写回)
     let mut history: Vec<RigMessage> = {
@@ -527,22 +554,146 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         map.get(&chat_id).cloned().unwrap_or_default()
     };
 
-    match agent.chat(user_msg, &mut history).await {
-        Ok(reply) => {
-            tracing::info!(
-                "Agent 回复完成: chat={} 共 {} 轮历史",
-                chat_id,
-                history.len()
-            );
-            state.bot.send_message(chat_id, reply).await?;
+    // 流式跑 agent:文本增量实时刷到占位消息(节流防触发 Telegram 限频),
+    // 最终回复与本轮新增历史以 FinalResponse 为准
+    let mut stream = agent.stream_chat(user_msg, history.clone()).await;
+
+    let mut preview = String::new();
+    let mut preview_sent = String::new();
+    let mut last_edit = tokio::time::Instant::now();
+    let mut next_wait = random_edit_wait(state.stream_edit_interval);
+    let mut final_response: Option<PromptResponse> = None;
+    let mut stream_error: Option<StreamingError> = None;
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                preview.push_str(&text.text);
+                // 新一轮的首个文本(首轮,或工具调用之后):先新建占位消息
+                if placeholder.is_none() {
+                    match state.bot.send_message(chat_id, "🤔 思考中…").await {
+                        Ok(m) => placeholder = Some(m.id),
+                        Err(e) => tracing::warn!("占位消息发送失败(下个文本再试): {e}"),
+                    }
+                }
+                // 节流:距上次编辑不足随机等待时长就先攒着,最后统一补发
+                if let Some(pid) = placeholder
+                    && last_edit.elapsed() >= next_wait
+                {
+                    match state
+                        .bot
+                        .edit_message_text(chat_id, pid, preview.clone())
+                        .await
+                    {
+                        Ok(_) => {
+                            preview_sent = preview.clone();
+                            last_edit = tokio::time::Instant::now();
+                            next_wait = random_edit_wait(state.stream_edit_interval);
+                        }
+                        Err(e) => tracing::warn!("流式更新消息失败(继续尝试): {e}"),
+                    }
+                }
+            }
+            // 模型发起工具调用:之前的文本是中间轮次的输出。
+            // 占位消息有内容则定稿(补发节流余量并标记为中间输出),空则删除,
+            // 让后续审批消息与最终回复都排在它之后
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                ..
+            })) => {
+                if let Some(pid) = placeholder.take() {
+                    if preview.trim().is_empty() {
+                        if let Err(e) = state.bot.delete_message(chat_id, pid).await {
+                            tracing::warn!("删除占位消息失败: {e}");
+                        }
+                    } else if let Err(e) = state
+                        .bot
+                        .edit_message_text(chat_id, pid, format!("📝 {preview}"))
+                        .await
+                    {
+                        tracing::warn!("中间输出定稿失败: {e}");
+                    }
+                }
+                preview.clear();
+                preview_sent.clear();
+            }
+            // 该轮被 hook 拒绝重试:临时文本作废,占位消息一并删除,新一轮文本会重建
+            Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {
+                if let Some(pid) = placeholder.take()
+                    && let Err(e) = state.bot.delete_message(chat_id, pid).await
+                {
+                    tracing::warn!("删除占位消息失败: {e}");
+                }
+                preview.clear();
+                preview_sent.clear();
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
+                final_response = Some(resp);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                stream_error = Some(e);
+                break;
+            }
         }
-        Err(e) => {
+    }
+
+    let reply = match (stream_error, final_response) {
+        (Some(e), _) => {
             tracing::error!("Agent 出错: chat={} {e}", chat_id);
+            // 占位消息还是空的就删掉,避免残留「思考中…」
+            if let Some(pid) = placeholder.take()
+                && preview.trim().is_empty()
+            {
+                let _ = state.bot.delete_message(chat_id, pid).await;
+            }
             state
                 .bot
                 .send_message(chat_id, format!("⚠️ Agent 出错: {e}"))
                 .await?;
+            return Ok(());
         }
+        (None, Some(resp)) => {
+            // resp.messages 是本轮新增消息(含用户输入),接在旧历史后面
+            history.extend(resp.messages.unwrap_or_default());
+            resp.output
+        }
+        (None, None) => {
+            // 流结束却没收到 FinalResponse(异常):有预览文本就保留,否则报错
+            if preview.is_empty() {
+                // 删掉占位消息,避免残留「思考中…」
+                if let Some(pid) = placeholder.take() {
+                    let _ = state.bot.delete_message(chat_id, pid).await;
+                }
+                state
+                    .bot
+                    .send_message(chat_id, "⚠️ Agent 出错: 流结束但没有最终响应")
+                    .await?;
+                return Ok(());
+            }
+            preview.clone()
+        }
+    };
+
+    tracing::info!(
+        "Agent 回复完成: chat={} 共 {} 轮历史",
+        chat_id,
+        history.len()
+    );
+
+    // 收尾:最终回复写入当前占位消息(与最后一次预览相同则跳过,
+    // Telegram 对相同文本的编辑会报错);没有占位(异常)则新发一条;
+    // 回复为空则删掉占位,避免残留「思考中…」
+    match placeholder {
+        Some(pid) if !reply.is_empty() && reply != preview_sent => {
+            state.bot.edit_message_text(chat_id, pid, reply).await?;
+        }
+        None if !reply.is_empty() => {
+            state.bot.send_message(chat_id, reply).await?;
+        }
+        Some(pid) if reply.is_empty() => {
+            let _ = state.bot.delete_message(chat_id, pid).await;
+        }
+        _ => {}
     }
 
     {
@@ -674,6 +825,28 @@ pub async fn on_callback(state: AppState, q: CallbackQuery) -> HandlerResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn random_edit_wait_below_floor_clamps_to_200ms() {
+        // 配置小于 200ms 时按 200ms 执行
+        for _ in 0..50 {
+            assert_eq!(
+                random_edit_wait(Duration::from_millis(50)),
+                Duration::from_millis(200)
+            );
+        }
+    }
+
+    #[test]
+    fn random_edit_wait_stays_within_bounds() {
+        let floor = Duration::from_millis(200);
+        let ceiling = Duration::from_millis(750);
+        for _ in 0..200 {
+            let w = random_edit_wait(ceiling);
+            assert!((floor..=ceiling).contains(&w), "wait {w:?} 越界");
+        }
+    }
 
     /// 造一张高频噪点图,保证高质 JPEG 编码后远超 256KB。
     fn noisy_jpeg(w: u32, h: u32, quality: u8) -> Vec<u8> {
