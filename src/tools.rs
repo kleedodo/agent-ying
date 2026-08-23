@@ -3,12 +3,22 @@
 
 use std::path::{Path, PathBuf};
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD as BASE64;
+use rig::OneOrMany;
+use rig::client::CompletionClient;
+use rig::completion::message::{
+    DocumentSourceKind, Image as RigImage, ImageMediaType, Text as RigText, UserContent,
+};
+use rig::completion::{Chat, Message as RigMessage};
+use rig::providers::openai;
 use rig::tool::Tool;
 use serde::Deserialize;
 use teloxide::prelude::*;
 use thiserror::Error;
 
 use crate::approval::{ApprovalManager, request_approval};
+use crate::handlers::compress_image;
 
 const MAX_OUTPUT_CHARS: usize = 30000;
 
@@ -93,7 +103,7 @@ impl Tool for Bash {
         if !approved {
             tracing::info!("bash 被用户拒绝: {}", args.command);
             return Ok(format!(
-                "用户拒绝了执行命令 `{}`,请换一种方式或追问用户。",
+                "用户拒绝了执行命令 `{}`，立即停止尝试并追问用户原因。",
                 args.command
             ));
         }
@@ -183,7 +193,7 @@ impl Tool for ReadSkill {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "要读取的文件路径(绝对路径,或相对于 skills 目录)"
+                    "description": "要读取的文件路径(绝对路径，或相对于 skills 目录)"
                 }
             },
             "required": ["path"]
@@ -310,7 +320,7 @@ impl Tool for SendFile {
         if !approved {
             tracing::info!("send_file 被用户拒绝: {}", args.path);
             return Ok(format!(
-                "用户拒绝了发送文件 `{}`,请换一种方式或追问用户。",
+                "用户拒绝了发送文件 `{}`，立即停止尝试并追问用户原因。",
                 args.path
             ));
         }
@@ -333,6 +343,173 @@ impl Tool for SendFile {
                 metadata.len()
             )),
             Err(e) => Err(ToolErr(format!("发送文件 `{}` 失败: {e}", args.path))),
+        }
+    }
+}
+
+// -------------------------------------------------------------------- vision
+
+/// vision 工具输出上限:16K 字符
+const MAX_VISION_CHARS: usize = 32 * 1024;
+
+#[derive(Debug, Deserialize)]
+pub struct VisionArgs {
+    /// 要查看的图片路径(绝对路径或相对当前工作目录)
+    pub path: String,
+}
+
+/// 看图工具:用多模态模型看图片,调用前先请用户审批。
+#[derive(Clone)]
+pub struct Vision {
+    pub client: openai::CompletionsClient,
+    pub model: String,
+    /// 解析后的 vision 系统提示词(可被 VISION_SYSTEM.md 覆盖)
+    pub system_prompt: String,
+    /// 审批/发按钮所需的上下文(bot + chat + 审批管理器)
+    pub ctx: ToolCtx,
+}
+
+impl std::fmt::Debug for Vision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Vision")
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+/// 根据文件扩展名推断图片 media type,无法识别则报错。
+fn media_type_from_path(path: &str) -> Result<ImageMediaType, ToolErr> {
+    let ext = Path::new(path)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    match ext.as_str() {
+        "jpg" | "jpeg" => Ok(ImageMediaType::JPEG),
+        "png" => Ok(ImageMediaType::PNG),
+        "gif" => Ok(ImageMediaType::GIF),
+        "webp" => Ok(ImageMediaType::WEBP),
+        "heic" => Ok(ImageMediaType::HEIC),
+        "heif" => Ok(ImageMediaType::HEIF),
+        "svg" => Ok(ImageMediaType::SVG),
+        _ => Err(ToolErr(format!(
+            "无法识别图片格式 `{}`(支持 jpg/png/gif/webp/heic/heif/svg)",
+            path
+        ))),
+    }
+}
+
+impl Tool for Vision {
+    const NAME: &'static str = "vision";
+
+    type Error = ToolErr;
+    type Args = VisionArgs;
+    type Output = String;
+
+    fn description(&self) -> String {
+        "看图：是文字图片则按原结构提取文字，是风景/照片等非文字内容则详细描述图片内容".into()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要查看的图片路径(绝对路径)"
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let ctx = &self.ctx;
+
+        // 先检查文件存在性和大小,避免审批通过后才发现读不到
+        let metadata = tokio::fs::metadata(&args.path)
+            .await
+            .map_err(|e| ToolErr(format!("读取图片 `{}` 失败: {e}", args.path)))?;
+        if !metadata.is_file() {
+            return Err(ToolErr(format!("`{}` 不是普通文件", args.path)));
+        }
+
+        let approved = request_approval(
+            &ctx.bot,
+            ctx.chat_id,
+            &ctx.approvals,
+            ctx.approval_timeout,
+            "vision",
+            &format!("看图:`{}`({}B)", args.path, metadata.len()),
+        )
+        .await
+        .map_err(ToolErr)?;
+
+        if !approved {
+            tracing::info!("vision 被用户拒绝: {}", args.path);
+            return Ok(format!(
+                "用户拒绝了看图 `{}`，停止尝试并追问用户。",
+                args.path
+            ));
+        }
+
+        tracing::info!("vision 开始看图: {}", args.path);
+
+        // 1. 读文件
+        let bytes = tokio::fs::read(&args.path)
+            .await
+            .map_err(|e| ToolErr(format!("读取图片 `{}` 失败: {e}", args.path)))?;
+
+        // 2. 推断 media type + 大图压缩到 256KB 以下
+        let media_type = media_type_from_path(&args.path)?;
+        let (bytes, media_type) = compress_image(bytes, media_type);
+
+        // 3. base64 编码
+        let b64 = BASE64.encode(&bytes);
+
+        // 4. 构造「提示文字 + 图片」的用户消息
+        let image = UserContent::Image(RigImage {
+            data: DocumentSourceKind::base64(&b64),
+            media_type: Some(media_type),
+            detail: None,
+            additional_params: None,
+        });
+        let content = OneOrMany::many(vec![
+            UserContent::Text(RigText {
+                text: "请看这张图片。".to_string(),
+                additional_params: None,
+            }),
+            image,
+        ])
+        .expect("至少包含文本和图片两项内容");
+        let user_msg = RigMessage::User { content };
+
+        // 5. 构建 vision agent 并调用(单轮,无需历史)
+        let agent = self
+            .client
+            .agent(self.model.clone())
+            .name("vision")
+            .preamble(&self.system_prompt)
+            .build();
+        let mut history: Vec<RigMessage> = Vec::new();
+        let reply = agent
+            .chat(user_msg, &mut history)
+            .await
+            .map_err(|e| ToolErr(format!("vision 模型调用失败: {e}")))?;
+
+        tracing::info!(
+            "vision 完成: {} ({} 字符)",
+            args.path,
+            reply.chars().count()
+        );
+
+        // 6. 截断过长的输出
+        if reply.chars().count() <= MAX_VISION_CHARS {
+            Ok(reply)
+        } else {
+            let mut out: String = reply.chars().take(MAX_VISION_CHARS).collect();
+            out.push_str("\n…(已截断)");
+            Ok(out)
         }
     }
 }

@@ -22,7 +22,7 @@ use config::Config;
 use handlers::{on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
 use skills::Skills;
-use tools::{Bash, ReadSkill, SendFile, ToolCtx};
+use tools::{Bash, ReadSkill, SendFile, ToolCtx, Vision};
 
 // 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
 #[global_allocator]
@@ -39,6 +39,10 @@ struct AppState {
     histories: Arc<Mutex<HashMap<ChatId, Vec<Message>>>>,
     name: String,
     model: String,
+    vision_model: String,
+    /// None 表示 vision_model 留空、未启用 vision agent
+    vision_client: Option<openai::CompletionsClient>,
+    vision_system_prompt: String,
     system_prompt: String,
     bash_timeout: Duration,
     approval_timeout: Duration,
@@ -65,14 +69,25 @@ impl AppState {
             bash_timeout: self.bash_timeout,
             approval_timeout: self.approval_timeout,
         };
-        self.client
+        let mut builder = self
+            .client
             .agent(self.model.clone())
             .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
-            .tool(SendFile(ctx))
-            .tool(ReadSkill(self.skills_dir.clone()))
-            // 采样参数与最大轮数都从配置读取
+            .tool(SendFile(ctx.clone()))
+            .tool(ReadSkill(self.skills_dir.clone()));
+        // vision_model 留空(或省略)则不启用 vision agent
+        if let Some(vision_client) = &self.vision_client {
+            builder = builder.tool(Vision {
+                client: vision_client.clone(),
+                model: self.vision_model.clone(),
+                system_prompt: self.vision_system_prompt.clone(),
+                ctx: ctx.clone(),
+            });
+        }
+        // 采样参数与最大轮数都从配置读取
+        builder
             .temperature(self.temperature)
             .max_tokens(self.max_tokens)
             .default_max_turns(self.max_turns)
@@ -93,6 +108,20 @@ fn build_handler() -> dptree::Handler<
         .branch(dptree::endpoint(on_unmatched))
 }
 
+/// 构建 OpenAI 兼容客户端:base_url 留空则用官方地址。
+fn build_openai_client(
+    api_key: &str,
+    base_url: Option<&str>,
+) -> Result<openai::CompletionsClient, Box<dyn std::error::Error + Send + Sync>> {
+    match base_url {
+        Some(b) if !b.is_empty() => Ok(openai::CompletionsClient::builder()
+            .api_key(api_key)
+            .base_url(b)
+            .build()?),
+        _ => Ok(openai::CompletionsClient::new(api_key.to_string())?),
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // 默认 Info 级别,可通过 RUST_LOG 环境变量覆盖
@@ -109,6 +138,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::load()?;
     let bash_timeout = Duration::from_secs(config.bash_timeout_secs);
     let approval_timeout = Duration::from_secs(config.approval_timeout_secs);
+    // vision_model 留空(或省略)则不启用 vision agent
+    let vision_enabled = !config.vision_model.trim().is_empty();
     tracing::info!(
         "配置加载完成: name={}, model={}, base_url={}, bash 超时 {}s, 审批超时 {}s, 白名单 {} 人, temperature={}, max_turns={}, max_tokens={}",
         config.name,
@@ -124,15 +155,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         config.max_turns,
         config.max_tokens,
     );
+    if vision_enabled {
+        tracing::info!(
+            "vision agent 已启用: model={}, base_url={}",
+            config.vision_model,
+            config
+                .vision_base_url
+                .as_deref()
+                .unwrap_or("(同主 base_url / 官方)")
+        );
+    } else {
+        tracing::info!("vision agent 未启用(vision_model 留空)");
+    }
 
     let bot = Bot::new(config.telegram_bot_token.clone());
-    // 自定义 OpenAI 兼容 base_url(留空则用官方地址)
-    let client = match config.openai_base_url {
-        Some(ref base_url) if !base_url.is_empty() => openai::CompletionsClient::builder()
-            .api_key(&config.openai_api_key)
-            .base_url(base_url)
-            .build()?,
-        _ => openai::CompletionsClient::new(config.openai_api_key.clone())?,
+    // 主 agent 客户端:自定义 OpenAI 兼容 base_url(留空则用官方地址)
+    let client = build_openai_client(&config.openai_api_key, config.openai_base_url.as_deref())?;
+    // vision agent:仅当 vision_model 非空时启用;独立的 base_url / api_key,留空则回退到主配置
+    let (vision_client, vision_system_prompt) = if vision_enabled {
+        let vision_api_key = config
+            .vision_api_key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&config.openai_api_key);
+        // vision_base_url 留空则回退到 openai_base_url(再留空则用官方地址)
+        let vision_base_url = config
+            .vision_base_url
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or(config.openai_base_url.as_deref());
+        let client = build_openai_client(vision_api_key, vision_base_url)?;
+        let prompt = Config::resolve_vision_prompt();
+        (Some(client), prompt)
+    } else {
+        (None, String::new())
     };
     // 加载 skills(固定目录 ~/.agent-ying/skills/),把索引拼到系统提示末尾
     let skills = Skills::load(Config::skills_dir());
@@ -155,6 +211,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         histories: Arc::new(Mutex::new(HashMap::new())),
         name: config.name,
         model: config.model,
+        vision_model: config.vision_model,
+        vision_client,
+        vision_system_prompt,
         system_prompt,
         bash_timeout,
         approval_timeout,

@@ -72,7 +72,10 @@ const MAX_IMAGE_BYTES: usize = 256 * 1024;
 
 /// 若图片超过 256KB,则解码后重编码为 JPEG,逐步降低质量与尺寸,直到不超过上限。
 /// 返回 (新字节, 对应 media_type)。未超限时原样返回。
-fn compress_image(bytes: Vec<u8>, media_type: ImageMediaType) -> (Vec<u8>, ImageMediaType) {
+pub(crate) fn compress_image(
+    bytes: Vec<u8>,
+    media_type: ImageMediaType,
+) -> (Vec<u8>, ImageMediaType) {
     if bytes.len() <= MAX_IMAGE_BYTES {
         return (bytes, media_type);
     }
@@ -202,7 +205,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                     msg.chat.id,
                     "👋 我是 ying!直接发文本或图片就行。\n\
                      我可以用 `bash` 跑命令,也能看你发的图片,\n\
-                     还能把文件直接发给你(send_file)。\n\
+                     还能看电脑上的图片(vision)、把文件直接发给你(send_file)。\n\
                      每次调用工具前都会发按钮请你明确同意。\n\
                      发送 /new 可以开启新会话(清空对话历史)。",
                 )

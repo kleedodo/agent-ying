@@ -37,16 +37,34 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Tele
 ## 能力
 
 你的工具：
-- bash：在用户的电脑上执行 shell 命令
-- send_file：把电脑上的文件（如图片、文档、生成的代码文件）发送给用户，可以附带一句说明
-- read_skill：读取 skills 目录下的文件（如 SKILL.md 及其附属文件），只读、无需审批
+- bash：执行 shell 命令
+- send_file：把文件发送给用户，可以附带一句说明
+- read_skill：读取 skills 目录下的文件获得专业领域知识
+- vision：查阅图片文件。文字图片按原结构提取文字；风景/照片等非文字内容返回详细描述
 
 注意：
-- 每次调用工具前都会先弹出 Telegram 按钮请用户明确同意；用户可能拒绝，被拒绝时换一种方式或追问用户，不要反复硬试。
-- 需要把文件交给用户时（比如生成的图片、报告、代码），用 send_file 发过去，而不是只贴路径。
+- 调用工具可能会失败，比如用户可能会拒绝，此时立即停止尝试并追问用户原因，不要反复硬试。
+- 需要把文件交给用户时，用 send_file 发过去，而不是只贴路径。
 - 用户使用什么语言提问就用什么语言回复。
-- 在处理文件或者数据时，先确认文件是否过大(>5kb)，如果过大，则使用合理的工具进行过滤，比如jq、grep、sed或者生成一个python脚本过滤等
+- 在处理文件或者数据时，使用合理的工具进行过滤，比如jq、grep、sed或者生成一个python脚本过滤等
 - 回复尽量简短，代码／命令输出超过必要长度时做摘要。"#;
+
+/// vision agent(看图工具)的默认系统提示词。
+/// 可被 `~/.agent-ying/VISION_SYSTEM.md` 覆盖。
+pub const DEFAULT_VISION_PROMPT: &str = r#"你是一个专门看图的 vision agent,负责把图片内容转成文字交给主 agent。根据图片内容分两种情况处理:
+
+1. 如果图片主要是文字(文档、截图、代码、白板、手写笔记、表格等):
+   - 尽量按照原来的结构提取文字,保留标题层级、列表、代码块、表格、换行、缩进等结构
+   - 用 Markdown 格式输出:代码用 ``` 包裹,表格用 Markdown 表格,层级用 #/列表
+   - 忠实还原文字内容,不要总结、不要遗漏、不要改写
+
+2. 如果图片是风景、照片、插画、图表等非文字内容:
+   - 使用准确、具体的语言详细描述图片内容:主体及其动作/状态、环境与背景、颜色与光线、构图、值得注意的细节
+   - 只描述你确实看到的,不要过度解读或编造
+
+3. 如果图片模糊、被截断或难以辨认,如实说明。
+
+直接输出提取的文字或描述本身,不要加“这张图片是……”之类的寒暄开场白。"#;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
@@ -63,6 +81,16 @@ pub struct Config {
     pub name: String,
     /// 模型名,如 gpt-5-mini、gpt-5
     pub model: String,
+    /// vision agent(看图工具)使用的模型,需支持多模态,如 gpt-5-mini、gpt-4o
+    /// 留空(或省略)则不启用 vision agent
+    #[serde(default)]
+    pub vision_model: String,
+    /// vision agent 专用的 API key,留空则回退到 openai_api_key
+    #[serde(default)]
+    pub vision_api_key: Option<String>,
+    /// vision agent 专用的 OpenAI 兼容 base URL,留空则回退到 openai_base_url(再留空则用官方地址)
+    #[serde(default)]
+    pub vision_base_url: Option<String>,
     /// bash 工具超时(秒)
     pub bash_timeout_secs: u64,
     /// 审批等待超时(秒),超过则按拒绝处理
@@ -90,6 +118,9 @@ impl Default for Config {
             openai_base_url: None,
             name: DEFAULT_NAME.to_string(),
             model: DEFAULT_MODEL.to_string(),
+            vision_model: String::new(),
+            vision_api_key: None,
+            vision_base_url: None,
             bash_timeout_secs: DEFAULT_BASH_TIMEOUT_SECS,
             approval_timeout_secs: DEFAULT_APPROVAL_TIMEOUT_SECS,
             allowed_user_ids: Vec::new(),
@@ -133,6 +164,11 @@ impl Config {
 
     pub fn system_md_path() -> PathBuf {
         Self::dir().join("SYSTEM.md")
+    }
+
+    /// vision agent 系统提示词覆盖文件路径
+    pub fn vision_system_md_path() -> PathBuf {
+        Self::dir().join("VISION_SYSTEM.md")
     }
 
     /// skills 根目录(固定为 `~/.agent-ying/skills/`)
@@ -183,6 +219,19 @@ impl Config {
         }
         prompt
     }
+
+    /// 解析 vision agent 的系统提示,优先级从高到低:
+    /// 1. `~/.agent-ying/VISION_SYSTEM.md`(存在则用其内容)
+    /// 2. 代码内默认值 DEFAULT_VISION_PROMPT
+    pub fn resolve_vision_prompt() -> String {
+        let md = Self::vision_system_md_path();
+        if let Ok(content) = fs::read_to_string(&md) {
+            tracing::info!("vision 系统提示词使用 {}", md.display());
+            content
+        } else {
+            DEFAULT_VISION_PROMPT.to_string()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -193,6 +242,12 @@ mod tests {
     /// 若本机存在该文件则跳过与提示词内容相关的断言测试。
     fn has_system_md() -> bool {
         Config::system_md_path().is_file()
+    }
+
+    /// `resolve_vision_prompt` 优先读 `~/.agent-ying/VISION_SYSTEM.md`，
+    /// 若本机存在该文件则跳过与提示词内容相关的断言测试。
+    fn has_vision_system_md() -> bool {
+        Config::vision_system_md_path().is_file()
     }
 
     #[test]
@@ -209,5 +264,14 @@ mod tests {
             cfg.resolve_system_prompt(),
             DEFAULT_SYSTEM_PROMPT.replace("{{char}}", "阿绿")
         );
+    }
+
+    #[test]
+    fn resolve_vision_prompt_falls_back_to_default() {
+        if has_vision_system_md() {
+            eprintln!("跳过: 存在 {}", Config::vision_system_md_path().display());
+            return;
+        }
+        assert_eq!(Config::resolve_vision_prompt(), DEFAULT_VISION_PROMPT);
     }
 }
