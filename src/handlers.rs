@@ -90,7 +90,11 @@ async fn build_user_message(
     // 1. 图片:photo 优先(总是 JPEG),其次 image/* 的 document
     // Telegram 的 photo 带多档尺寸,取宽度 ≤1080 的最大档省流量;没有则退回最大档
     if let Some(photos) = msg.photo().as_ref()
-        && let Some(photo) = photos.iter().rev().find(|p| p.width <= 1080).or_else(|| photos.last())
+        && let Some(photo) = photos
+            .iter()
+            .rev()
+            .find(|p| p.width <= 1080)
+            .or_else(|| photos.last())
     {
         let bytes = download_file_bytes(bot, &photo.file.id).await?;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
@@ -273,6 +277,25 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     }
 
     let text = msg.text().map(str::to_owned);
+    // 图片消息没有 text,日志里改打 caption;没有 caption 则打 [图片消息]
+    let log_text = text.clone().or_else(|| {
+        let is_image = msg.photo().is_some()
+            || msg.document().as_ref().is_some_and(|d| {
+                d.mime_type
+                    .as_ref()
+                    .is_some_and(|m| m.to_string().starts_with("image/"))
+            });
+        if is_image {
+            Some(
+                msg.caption()
+                    .map(str::to_string)
+                    .filter(|c| !c.trim().is_empty())
+                    .unwrap_or_else(|| "[图片消息]".to_string()),
+            )
+        } else {
+            None
+        }
+    });
 
     // 简单的 /start、/help、/new 命令(文本消息)
     if let Some(t) = &text {
@@ -317,7 +340,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         "收到消息: chat={} user={:?} text={:?}",
         msg.chat.id,
         msg.from.as_ref().map(|f| f.id),
-        text,
+        log_text,
     );
 
     let chat_id = msg.chat.id;
