@@ -181,6 +181,11 @@ impl Config {
         Self::dir().join("skills")
     }
 
+    /// 收件箱目录:save_incoming 工具把用户发来的文件原样存到这里
+    pub fn inbox_dir() -> PathBuf {
+        Self::dir().join("inbox")
+    }
+
     pub fn path() -> PathBuf {
         Self::dir().join("config.json")
     }

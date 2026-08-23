@@ -7,11 +7,12 @@
 ## 功能
 
 - **Telegram 聊天机器人**:通过 teloxide 接收消息,同一会话内消息串行处理,保持上下文
-- **多模态输入**:用户发的图片会先压缩到 256KB 以下,再以 data URL 形式直接喂给主模型;`forward_to_vision: true`(默认,主模型非多模态时)且 vision 已启用时,图片会存到临时文件并转发给 vision 工具查看(免审批,调用结束后自动删除);vision 未启用时图片仍原样内嵌发给主模型
+- **多模态输入**:用户发的图片会先压缩到 256KB 以下,再以 data URL 形式直接喂给主模型;`forward_to_vision: true`(默认,主模型非多模态时)且 vision 已启用时,图片会存到临时文件并转发给 vision 工具查看(免审批,调用结束后自动删除);vision 未启用时图片仍原样内嵌发给主模型。文档/视频/音频只把元数据(文件名、大小、视频时长、消息 ID)告诉主模型,不下载本体;用户明确要求保存时由 `save_incoming` 工具原样下载
 - **工具调用**:
   - `bash`:在用户的电脑上执行 shell 命令(可配置超时,输出超长自动截断)
   - `send_file`:把电脑上的文件(图片、文档、生成的代码等)发送给用户
   - `read_skill`:读取 skills 目录下的技能文件(如 SKILL.md 及其附属文件),只读、无需审批
+  - `save_incoming`:把用户发来的文件(图片/视频/文档/音频)原样后台下载存到 `~/.agent-ying/inbox/YYYY-MM/`,文件名为 `<消息时间戳>-<消息ID>-<原始文件名>`,下载完成后自动通知用户;只在用户明确要求保存时才调用。受 Telegram Bot API 限制,单个文件最大 20MB;文件元数据缓存在内存里,bot 重启后之前收到的文件就查不到了
   - `vision`:看图工具——文字图(截图/文档/代码)按原结构提取文字,风景/照片等非文字内容详细描述;由独立的多模态 agent 驱动,可单独配置模型 / API key / base URL,`vision_model` 留空则不启用
 - **按钮审批**：每次调用工具前都会弹出 Telegram 内联按钮，用户点「同意」才执行；超时未点按拒绝处理。例外:用户发图转发给 vision 查看时免审批(发图即视为同意)
 - **用户白名单**:可配置只响应指定的 Telegram user id
@@ -129,7 +130,7 @@ src/
 ├── main.rs      # 入口:配置加载、agent 构建、dptree handler 注册
 ├── config.rs    # ~/.agent-ying/config.json 的加载与默认模板
 ├── handlers.rs  # Telegram 消息 / 按钮回调处理
-├── tools.rs     # rig 工具:bash、send_file、read_skill
+├── tools.rs     # rig 工具:bash、send_file、save_incoming、read_skill、vision
 ├── skills.rs    # 扫描 ~/.agent-ying/skills/,生成系统提示里的技能索引
 └── approval.rs  # 工具执行前的 Telegram 按钮审批
 ```

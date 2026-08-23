@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rig::client::CompletionClient;
+use rig::client::AgentClientExt;
 use rig::completion::Message;
 use rig::providers::openai;
 use teloxide::prelude::*;
@@ -19,17 +19,17 @@ use std::path::PathBuf;
 
 use approval::ApprovalManager;
 use config::Config;
-use handlers::{on_callback, on_message, on_unmatched};
+use handlers::{IncomingFileCache, on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
 use skills::Skills;
-use tools::{Bash, ReadSkill, SendFile, ToolCtx, Vision};
+use tools::{Bash, ReadSkill, SaveIncoming, SendFile, ToolCtx, Vision};
 
 // 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// 使用 OpenAI Chat Completions API(兼容大部分第三方网关)。
-type YingAgent = rig::agent::Agent<openai::CompletionModel>;
+type YingAgent = rig::agent::Agent;
 
 #[derive(Clone)]
 struct AppState {
@@ -48,6 +48,8 @@ struct AppState {
     system_prompt: String,
     bash_timeout: Duration,
     approval_timeout: Duration,
+    /// 用户发来的文件元数据缓存(save_incoming 按消息 ID 查 file_id)
+    incoming_files: IncomingFileCache,
     allowed_user_ids: Vec<UserId>,
     temperature: f64,
     max_turns: usize,
@@ -70,6 +72,7 @@ impl AppState {
             approvals: self.approvals.clone(),
             bash_timeout: self.bash_timeout,
             approval_timeout: self.approval_timeout,
+            incoming_files: self.incoming_files.clone(),
         };
         let mut builder = self
             .client
@@ -78,6 +81,7 @@ impl AppState {
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
             .tool(SendFile(ctx.clone()))
+            .tool(SaveIncoming(ctx.clone()))
             .tool(ReadSkill(self.skills_dir.clone()));
         // vision_model 留空(或省略)则不启用 vision agent
         if let Some(vision_client) = &self.vision_client {
@@ -225,6 +229,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         system_prompt,
         bash_timeout,
         approval_timeout,
+        incoming_files: IncomingFileCache::new(),
         allowed_user_ids: config.allowed_user_ids,
         temperature: config.temperature,
         max_turns: config.max_turns,
