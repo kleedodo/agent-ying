@@ -25,11 +25,12 @@ use crate::handlers::{
 };
 
 /// bash 输出超过该字符数时落盘并返回头尾摘要
-const MAX_OUTPUT_CHARS: usize = 15000;
-/// 落盘后返回摘要中保留的头部字符数
-const SPILL_HEAD_CHARS: usize = 6000;
+/// 输出会进多轮历史、每轮重复送给模型,故阈值偏保守:够多数命令用,超出就落盘让模型按需取
+const MAX_OUTPUT_CHARS: usize = 8000;
+/// 落盘后返回摘要中保留的头部字符数(与尾部之和须小于 MAX_OUTPUT_CHARS)
+const SPILL_HEAD_CHARS: usize = 3000;
 /// 落盘后返回摘要中保留的尾部字符数
-const SPILL_TAIL_CHARS: usize = 4000;
+const SPILL_TAIL_CHARS: usize = 2000;
 
 /// bash 超长输出的落盘目录
 const TOOL_OUT_DIR: &str = "/tmp/agent-ying/tool-out";
