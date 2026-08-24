@@ -194,12 +194,10 @@ impl Tool for Bash {
 
 //-------------------------------------------------------------- read_skill
 
-/// read_skill 输出上限:128K 字符(单行超长的极端情况兼做兑底)
-const MAX_READ_SKILL_CHARS: usize = 128 * 1024;
 /// read_skill 默认最多读取的行数
 const DEFAULT_READ_LIMIT: usize = 2000;
-/// read_skill 默认最多读取的输出字节数(与行数上限取先到者)
-const DEFAULT_READ_BYTES: usize = 50 * 1024;
+/// read_skill 输出字节上限(与行数上限取先到者)
+const MAX_READ_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadSkillArgs {
@@ -207,7 +205,7 @@ pub struct ReadSkillArgs {
     pub path: String,
     /// 从第几行开始读(1 起,默认 1)
     pub offset: Option<usize>,
-    /// 最多读多少行(默认 2000,未显式指定时还受 50KB 输出上限约束)
+    /// 最多读多少行（默认 2000，输出达到 50KB 也会截断）
     pub limit: Option<usize>,
 }
 
@@ -231,7 +229,7 @@ impl Tool for ReadSkill {
     fn description(&self) -> String {
         format!(
             "读取 skills 目录（{}）下的文件，如 SKILL.md 或它的附属文件。\
-             返回内容带行号前缀；默认从第 1 行起读最多 {} 行或 50KB（先到者为准），\
+             返回内容带行号前缀；从第 1 行起最多读 {} 行或 50KB（先到者为准），\
              截断时会附提示，可用 offset（起始行号）续读，也可用 limit 指定行数",
             self.0.display(),
             DEFAULT_READ_LIMIT
@@ -252,7 +250,7 @@ impl Tool for ReadSkill {
                 },
                 "limit": {
                     "type": "integer",
-                    "description": "最多读多少行（默认 2000，未显式指定时还受 50KB 输出上限约束）"
+                    "description": "最多读多少行（默认 2000，输出达到 50KB 也会截断）"
                 }
             },
             "required": ["path"]
@@ -292,7 +290,7 @@ impl Tool for ReadSkill {
 
         // 按行分页:offset(1 起)~ offset+limit,输出带行号前缀
         let offset = args.offset.unwrap_or(1).max(1);
-        let explicit_limit = args.limit.map(|l| l.max(1));
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
         let lines: Vec<&str> = content.lines().collect();
         let total = lines.len();
         let start = offset.saturating_sub(1);
@@ -302,14 +300,14 @@ impl Tool for ReadSkill {
                 offset
             ));
         }
-        let mut end = (start + explicit_limit.unwrap_or(DEFAULT_READ_LIMIT)).min(total);
-        // 未显式指定 limit 时,输出达到 50KB 即截断(与行数上限取先到者)
-        if explicit_limit.is_none() {
+        let mut end = (start + limit).min(total);
+        // 输出达到 50KB 即截断(与行数上限取先到者)
+        {
             let mut size = 0usize;
             for (i, line) in lines[start..end].iter().enumerate() {
                 // 每行输出为 "行号：内容\n",按字节估算
                 size += (start + i + 1).to_string().len() + 3 + line.len();
-                if size > DEFAULT_READ_BYTES {
+                if size > MAX_READ_BYTES {
                     if i == 0 {
                         // 单行即超 50KB,read_skill 不适合,让 agent 改用 bash
                         return Err(ToolErr(format!(
@@ -334,13 +332,6 @@ impl Tool for ReadSkill {
                 total,
                 end + 1
             ));
-        }
-
-        // 兑底:单行超长导致输出超限时截断
-        if out.chars().count() > MAX_READ_SKILL_CHARS {
-            let mut truncated: String = out.chars().take(MAX_READ_SKILL_CHARS).collect();
-            truncated.push_str("\n…（已截断）");
-            out = truncated;
         }
         Ok(out)
     }
