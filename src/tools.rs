@@ -17,26 +17,56 @@ use serde::Deserialize;
 use teloxide::prelude::*;
 use teloxide::types::MessageId;
 use thiserror::Error;
+use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, request_approval};
 use crate::handlers::{
     IncomingFile, IncomingFileCache, compress_image, download_file_bytes, is_temp_image_path,
 };
 
-const MAX_OUTPUT_CHARS: usize = 30000;
+/// bash 输出超过该字符数时落盘并返回头尾摘要
+const MAX_OUTPUT_CHARS: usize = 15000;
+/// 落盘后返回摘要中保留的头部字符数
+const SPILL_HEAD_CHARS: usize = 6000;
+/// 落盘后返回摘要中保留的尾部字符数
+const SPILL_TAIL_CHARS: usize = 4000;
+
+/// bash 超长输出的落盘目录
+const TOOL_OUT_DIR: &str = "/tmp/agent-ying/tool-out";
 
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct ToolErr(pub String);
 
-fn truncate(s: &str) -> String {
-    if s.chars().count() <= MAX_OUTPUT_CHARS {
-        s.to_string()
-    } else {
-        let mut out: String = s.chars().take(MAX_OUTPUT_CHARS).collect();
-        out.push_str("\n…(已截断)");
-        out
+/// 输出未超长时原样返回;超长则把完整内容写入
+/// `/tmp/agent-ying/tool-out/<uuid>.txt`,返回头 + 尾摘要和完整文件路径,
+/// 模型可以用 bash 工具(sed/grep/tail)自行查看被省略的部分。
+async fn truncate_or_spill(s: &str) -> Result<String, ToolErr> {
+    let total = s.chars().count();
+    if total <= MAX_OUTPUT_CHARS {
+        return Ok(s.to_string());
     }
+
+    let dir = Path::new(TOOL_OUT_DIR);
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| ToolErr(format!("创建落盘目录 {} 失败: {e}", dir.display())))?;
+    let path = dir.join(format!("{}.txt", Uuid::new_v4()));
+    tokio::fs::write(&path, s)
+        .await
+        .map_err(|e| ToolErr(format!("写入完整输出 {} 失败: {e}", path.display())))?;
+
+    let head: String = s.chars().take(SPILL_HEAD_CHARS).collect();
+    let tail: String = s.chars().skip(total - SPILL_TAIL_CHARS).collect();
+    let dropped = total - SPILL_HEAD_CHARS - SPILL_TAIL_CHARS;
+    Ok(format!(
+        "{head}\n…(共 {total} 字符,中间省略 {dropped} 字符;完整输出已保存到 {},\n\
+         可用 `sed -n '200,300p' {}` 查看指定行、`grep 关键词 {}` 搜索、`tail -n 50 {}` 看结尾)\n{tail}",
+        path.display(),
+        path.display(),
+        path.display(),
+        path.display()
+    ))
 }
 
 /// 两个工具共用的字段:目标聊天 + 审批管理器 + 用户发来文件的缓存。
@@ -142,7 +172,7 @@ impl Tool for Bash {
                     report.push_str("\n--- stderr ---\n");
                     report.push_str(&stderr);
                 }
-                Ok(truncate(&report))
+                Ok(truncate_or_spill(&report).await?)
             }
             Ok(Err(e)) => Err(ToolErr(format!("命令启动失败: {e}"))),
             Err(_) => {
@@ -163,13 +193,19 @@ impl Tool for Bash {
 
 //-------------------------------------------------------------- read_skill
 
-/// read_skill 输出上限:128K 字符
+/// read_skill 输出上限:128K 字符(单行超长的极端情况兼做兑底)
 const MAX_READ_SKILL_CHARS: usize = 128 * 1024;
+/// read_skill 默认最多读取的行数
+const DEFAULT_READ_LIMIT: usize = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadSkillArgs {
     /// 要读取的文件路径(绝对路径,或相对于 skills 目录)
     pub path: String,
+    /// 从第几行开始读(1 起,默认 1)
+    pub offset: Option<usize>,
+    /// 最多读多少行(默认 2000)
+    pub limit: Option<usize>,
 }
 
 /// 只读 skills 根目录下的文件,只读无副作用,免审批。
@@ -191,8 +227,11 @@ impl Tool for ReadSkill {
 
     fn description(&self) -> String {
         format!(
-            "读取 skills 目录({})下的文件，如 SKILL.md 或它的附属文件",
-            self.0.display()
+            "读取 skills 目录({})下的文件，如 SKILL.md 或它的附属文件。\
+             返回内容带行号前缀；默认从第 1 行读最多 {} 行，\
+             文件较长时可用 offset(起始行号)和 limit(行数)分段读取",
+            self.0.display(),
+            DEFAULT_READ_LIMIT
         )
     }
 
@@ -203,6 +242,14 @@ impl Tool for ReadSkill {
                 "path": {
                     "type": "string",
                     "description": "要读取的文件路径(绝对路径，或相对于 skills 目录)"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几行开始读(1 起，默认 1)"
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多读多少行(默认 500)"
                 }
             },
             "required": ["path"]
@@ -240,14 +287,38 @@ impl Tool for ReadSkill {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败: {e}", args.path)))?;
 
-        let truncated = if content.chars().count() <= MAX_READ_SKILL_CHARS {
-            content
-        } else {
-            let mut out: String = content.chars().take(MAX_READ_SKILL_CHARS).collect();
-            out.push_str("\n…(已截断)");
-            out
-        };
-        Ok(truncated)
+        // 按行分页:offset(1 起)~ offset+limit,输出带行号前缀
+        let offset = args.offset.unwrap_or(1).max(1);
+        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
+        let lines: Vec<&str> = content.lines().collect();
+        let total = lines.len();
+        let start = offset.saturating_sub(1);
+        if start >= total {
+            return Ok(format!(
+                "(文件共 {total} 行,起始行 {} 已超出文件末尾)",
+                offset
+            ));
+        }
+        let end = (start + limit).min(total);
+        let mut out = String::new();
+        for (i, line) in lines[start..end].iter().enumerate() {
+            out.push_str(&format!("{}: {}\n", start + i + 1, line));
+        }
+        if end < total {
+            out.push_str(&format!(
+                "…(已截断:还有 {} 行未显示,用 offset={} 继续读)",
+                total - end,
+                end + 1
+            ));
+        }
+
+        // 兑底:单行超长导致输出超限时截断
+        if out.chars().count() > MAX_READ_SKILL_CHARS {
+            let mut truncated: String = out.chars().take(MAX_READ_SKILL_CHARS).collect();
+            truncated.push_str("\n…(已截断)");
+            out = truncated;
+        }
+        Ok(out)
     }
 }
 

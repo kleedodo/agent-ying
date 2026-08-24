@@ -39,6 +39,8 @@ image = { version = "0.25", default-features = false, features = [
 ] }
 # 本地时间格式化(save_incoming 工具的文件名时间戳)
 chrono = "0.4"
+# bash 超长输出落盘文件名的随机后缀
+uuid = { version = "1", features = ["v4"] }
 tracing = "0.1.44"
 # mimalloc 内存分配器,跨平台(含 musl 静态链接),抗碎片、多线程友好
 mimalloc = "0.1"
