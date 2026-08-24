@@ -690,8 +690,8 @@ impl Tool for SaveIncoming {
 
 // -------------------------------------------------------------------- vision
 
-/// vision 工具输出上限:16K 字符
-const MAX_VISION_CHARS: usize = 32 * 1024;
+/// vision 工具输出上限:8K 字符
+const MAX_VISION_CHARS: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 pub struct VisionArgs {
