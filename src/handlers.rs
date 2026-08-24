@@ -20,7 +20,10 @@ use teloxide::prelude::*;
 use teloxide::types::{ChatAction, FileId, InlineKeyboardMarkup, MessageId};
 use tokio::sync::Mutex;
 
-use crate::{AppState, approval::approval_body};
+use crate::{
+    AppState,
+    approval::{ResolveOutcome, approval_body},
+};
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -650,6 +653,8 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                 .bot
                 .send_message(chat_id, format!("⚠️ Agent 出错: {e}"))
                 .await?;
+            // 本轮收尾:审批日志消息追加「🏁 本轮结束」尾注(本轮无审批则不做任何事)
+            state.approvals.finish_run(&state.bot, chat_id).await;
             return Ok(());
         }
         (None, Some(resp)) => {
@@ -668,6 +673,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                     .bot
                     .send_message(chat_id, "⚠️ Agent 出错: 流结束但没有最终响应")
                     .await?;
+                state.approvals.finish_run(&state.bot, chat_id).await;
                 return Ok(());
             }
             preview.clone()
@@ -695,6 +701,9 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         }
         _ => {}
     }
+
+    // 本轮收尾:审批日志消息追加「🏁 本轮结束」尾注(本轮无审批则不做任何事)
+    state.approvals.finish_run(&state.bot, chat_id).await;
 
     {
         let mut map = state.histories.lock().await;
@@ -763,39 +772,33 @@ pub async fn on_callback(state: AppState, q: CallbackQuery) -> HandlerResult {
         }
     };
 
-    // resolve 后 send 仍可能失败:点击恰好落在超时边界,等待方已把 receiver 丢掉。
-    // 这时按「已过期」处理,免得给用户一个假的「已同意」。
-    let resolved = state
-        .approvals
-        .resolve(id)
-        .await
-        .and_then(|tx| tx.send(approve).ok())
-        .is_some();
-    match resolved {
-        true => {
+    // 更新审批日志消息:标记对应记录,按钮跟随剩余待审批项
+    let outcome = if let Some(m) = q.message.as_ref().and_then(|m| m.regular_message()) {
+        state
+            .approvals
+            .resolve(&state.bot, m.chat.id, id, approve)
+            .await
+    } else {
+        ResolveOutcome::NoLog
+    };
+    match outcome {
+        ResolveOutcome::Resolved => {
             tracing::info!("审批决定: {} → {}", action, id);
-            // 把审批消息改成「已同意 / 已拒绝」并移除按钮,避免重复点击;
-            // 保留命令详情,方便回看
-            if let Some(m) = q.message.as_ref().and_then(|m| m.regular_message()) {
-                let label = if approve {
-                    "✅ 已同意"
-                } else {
-                    "❌ 已拒绝"
-                };
-                let text = m.text().unwrap_or_default();
-                let _ = state
-                    .bot
-                    .edit_message_text(m.chat.id, m.id, decided_text(label, text))
-                    .reply_markup(InlineKeyboardMarkup {
-                        inline_keyboard: vec![],
-                    })
-                    .await;
-            }
+            // 日志消息已由 resolve 更新(含该条记录的决定结果)
         }
-        // 常见原因:重复点击,或点击的是上一次 bot 进程留下的旧按钮(内存里的待审批表已清空)
-        false => {
-            tracing::warn!("找不到待审批项(可能已处理或已过期): {} → {}", action, id);
-            // 直接把旧消息改掉并摘掉按钮,给用户可见的反馈(同样保留命令详情)
+        // 该 chat 有日志但找不到对应审批项(如重复点击):消息已是正确状态,不用改
+        ResolveOutcome::Handled => {
+            tracing::warn!("审批项已处理(重复点击?): {} → {}", action, id);
+            let _ = state
+                .bot
+                .answer_callback_query(q.id.clone())
+                .text("⏳ 该按钮已处理或已过期")
+                .await;
+        }
+        // 该 chat 没有日志:常见于点击上一次 bot 进程留下的旧按钮(内存里的日志已清空),
+        // 直接把旧消息改掉并摘掉按钮,给用户可见的反馈(保留记录内容)
+        ResolveOutcome::NoLog => {
+            tracing::warn!("找不到审批日志(可能已处理或已过期): {} → {}", action, id);
             if let Some(m) = q.message.as_ref().and_then(|m| m.regular_message()) {
                 let text = m.text().unwrap_or_default();
                 let _ = state
