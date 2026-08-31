@@ -19,7 +19,7 @@ use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, request_approval};
-use crate::handlers::{compress_image, is_temp_image_path};
+use crate::handlers::compress_image;
 
 /// 工具输出超过该字符数时返回头尾摘要（全文始终落盘）
 /// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给摘要让模型按需取
@@ -502,9 +502,6 @@ impl Tool for Vision {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.ctx;
-        // 临时目录里的图片是「用户刚发来的图」（主模型非多模态时被转发过来）:
-        // 调用结束后（无论成败）自动删除
-        let is_temp = is_temp_image_path(&args.path);
 
         if !Path::new(&args.path).is_absolute() {
             return Err(ToolErr(format!(
@@ -534,10 +531,6 @@ impl Tool for Vision {
 
         if !approved {
             tracing::info!("vision 被用户拒绝：{}", args.path);
-            // 临时图片用户已看过，被拒绝时同样删除
-            if is_temp {
-                remove_temp_image(&args.path).await;
-            }
             return Ok(format!(
                 "用户拒绝了看图 `{}`，停止尝试并追问用户。",
                 args.path
@@ -546,7 +539,6 @@ impl Tool for Vision {
         tracing::info!("vision 开始看图：{}", args.path);
 
         // 1–6. 读文件 → 压缩 → 调 vision 模型 → 截断输出。
-        // 包在内部块里，保证任何一步失败（读文件、格式识别、网络等）都会走到下面的临时文件清理。
         let result: Result<String, ToolErr> = async {
             // 1. 读文件
             let bytes = tokio::fs::read(&args.path)
@@ -600,18 +592,6 @@ impl Tool for Vision {
         }
         .await;
 
-        // 7. 删除临时图片（用户发来的转发图，无论调用成败都不再需要）
-        if is_temp {
-            remove_temp_image(&args.path).await;
-        }
         result
-    }
-}
-
-/// 删除用户发来的转发图（临时目录内的图片），失败只告警不报错
-async fn remove_temp_image(path: &str) {
-    match tokio::fs::remove_file(path).await {
-        Ok(()) => tracing::info!("已删除临时图片：{path}"),
-        Err(e) => tracing::warn!("删除临时图片 `{path}` 失败：{e}"),
     }
 }

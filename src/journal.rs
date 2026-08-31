@@ -11,6 +11,8 @@
 //!         <uuid>.txt / <uuid>.txt.gz
 //!       images/                     # 图片二进制（jsonl 里只留 image_ref）
 //!         <uuid>.jpg
+//!       media/                      # 用户发来的文件（≤50MB 自动下载）
+//!         <uuid>-<原文件名>
 //! ```
 //!
 //！ 每行一条消息：`{"ts", "round", "seq", "msg"}`。
@@ -63,7 +65,7 @@ impl Journal {
         }
     }
 
-    /// 为新会话创建会话目录（顺带建 toolout/、images/ 目录）。
+    /// 为新会话创建会话目录（顺带建 toolout/、images/、media/ 目录）。
     /// 月目录按创建时间确定，之后的轮次始终写同一个会话目录。
     pub async fn create_session(&self, chat_id: i64) -> Result<SessionFile, std::io::Error> {
         let month = self.dir.join(Local::now().format("%Y-%m").to_string());
@@ -73,6 +75,7 @@ impl Journal {
         ));
         tokio::fs::create_dir_all(dir.join("toolout")).await?;
         tokio::fs::create_dir_all(dir.join("images")).await?;
+        tokio::fs::create_dir_all(dir.join("media")).await?;
         let path = dir.join("messages.jsonl");
         Ok(SessionFile { dir, path })
     }
@@ -96,6 +99,11 @@ impl SessionFile {
     /// 图片落盘目录（与 jsonl 同级的 images/）
     pub fn images_dir(&self) -> PathBuf {
         self.dir.join("images")
+    }
+
+    /// 用户发来的文件落盘目录（与 jsonl 同级的 media/）
+    pub fn media_dir(&self) -> PathBuf {
+        self.dir.join("media")
     }
 
     /// 把一轮的全部消息追加到文件末尾（每条消息一行）。

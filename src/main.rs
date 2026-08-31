@@ -46,7 +46,7 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<ChatId, journal::SessionFile>>>,
     name: String,
     model: String,
-    /// 是否把用户发来的图片转发给 vision 工具；true 且 vision 已启用时，图片存临时文件并转发
+    /// 是否把用户发来的图片转发给 vision 工具；true 且 vision 已启用时，图片存会话 media/ 目录并转发
     forward_to_vision: bool,
     vision_model: String,
     /// None 表示 vision_model 留空、未启用 vision agent

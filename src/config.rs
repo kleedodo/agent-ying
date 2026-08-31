@@ -78,7 +78,7 @@ pub struct Config {
     /// 模型名，如 gpt-5-mini、gpt-5
     pub model: String,
     /// 是否把用户发来的图片转发给 vision 工具查看（即主模型本身非多模态、不能直接看图）
-    /// true 且 vision 已启用时，图片存到临时文件，提示主 agent 用 vision 工具查看（调用后自动删除）;
+    /// true 且 vision 已启用时，图片存到会话 media/ 目录，提示主 agent 用 vision 工具查看;
     /// false（或 vision 未启用）时，图片原样内嵌发给主模型
     #[serde(default = "default_forward_to_vision")]
     pub forward_to_vision: bool,

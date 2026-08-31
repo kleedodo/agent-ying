@@ -21,46 +21,46 @@ use uuid::Uuid;
 use crate::{
     AppState,
     approval::{ResolveOutcome, approval_body},
+    journal::SessionFile,
+    tools::human_size,
 };
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
-/// 用户发来的图片的临时目录：`$TMPDIR/agent-ying/`
-pub(crate) fn temp_image_dir() -> PathBuf {
-    std::env::temp_dir().join("agent-ying")
-}
-
-/// 判断路径是否位于临时图片目录内（vision 工具据此在调用后自动删除）
-pub(crate) fn is_temp_image_path(path: &str) -> bool {
-    Path::new(path).starts_with(temp_image_dir())
-}
-
-/// 把用户发来的图片存为临时文件，命名 `<chat_id>-<消息 id>.<ext>`
-async fn save_temp_image(
-    msg: &Message,
+/// 把用户发来的图片存到会话 media/ 目录，命名 `<uuid>-<name>`
+async fn save_media_image(
+    session: &SessionFile,
     bytes: &[u8],
-    ext: &str,
+    name: &str,
+    mime: &str,
 ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let dir = temp_image_dir();
-    tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("{}-{}.{}", msg.chat.id.0, msg.id, ext));
+    let path = session.media_dir().join(media_file_name(name, mime));
     tokio::fs::write(&path, bytes).await?;
-    tracing::info!("用户发来的图片已存到临时文件： {}", path.display());
+    tracing::info!(
+        "用户发来的图片已存到： {}（{}）",
+        path.display(),
+        human_size(bytes.len() as u64)
+    );
     Ok(path)
 }
 
 /// 转发给 vision 时，图片对应的用户消息：
-/// 告诉主 agent 图片已存到哪个临时文件，请它调用 vision 工具查看；
+/// 告诉主 agent 图片已存到哪个文件（及大小），请它调用 vision 工具查看；
 /// 同时带上消息 ID 以便追溯。
-fn temp_image_text_message(msg_id: i32, caption: String, path: PathBuf) -> RigMessage {
+fn media_image_text_message(
+    msg_id: i32,
+    caption: String,
+    path: PathBuf,
+    size: String,
+) -> RigMessage {
     let text = if caption.trim().is_empty() {
         format!(
-            "用户发来一张图片（消息 ID {msg_id}），已保存到 {}，请用 vision 工具查看它。",
+            "用户发来一张图片（消息 ID {msg_id}），已保存到 {}（大小 {size}），请用 vision 工具查看它。",
             path.display()
         )
     } else {
         format!(
-            "用户发来一张图片并附说明「{}」（消息 ID {msg_id}），图片已保存到 {}，请用 vision 工具查看它。",
+            "用户发来一张图片并附说明「{}」（消息 ID {msg_id}），图片已保存到 {}（大小 {size}），请用 vision 工具查看它。",
             caption,
             path.display()
         )
@@ -73,30 +73,21 @@ fn temp_image_text_message(msg_id: i32, caption: String, path: PathBuf) -> RigMe
     }
 }
 
-/// 把 rig 的图片类型映射为临时文件扩展名（压缩可能改变格式，扩展名以压缩后的 media type 为准）。
-fn ext_for_media_type(mt: ImageMediaType) -> &'static str {
-    match mt {
-        ImageMediaType::JPEG => "jpg",
-        ImageMediaType::PNG => "png",
-        ImageMediaType::GIF => "gif",
-        ImageMediaType::WEBP => "webp",
-        ImageMediaType::HEIC => "heic",
-        ImageMediaType::HEIF => "heif",
-        ImageMediaType::SVG => "svg",
-    }
-}
+/// 用户发来的文件自动下载上限：50MB
+const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
 
 /// 从 Telegram 消息构建发给模型的用户消息。
 /// 支持：图片（photo，或 image/* 的 document，可带说明文字）、文档、视频、音频、纯文本。
-/// 图片：`forward_to_vision` 为 true 时存到临时文件并用文本提示主 agent 调 vision 工具；
+/// 图片：`forward_to_vision` 为 true 时存到会话 media/ 目录并用文本提示主 agent 调 vision 工具；
 /// 否则直接内嵌、原样发给上游。
-/// 文档/视频/音频只把元数据（文件名、大小、消息 ID，以及说明文字 caption）以文本形式
-/// 告诉主 agent，不下载文件本体。
+/// 文档/视频/音频：≤ 50MB 时自动下载到会话的 media/ 目录，并把落盘路径与大小告诉主 agent；
+/// 超过 50MB 只把元数据（文件名、大小、消息 ID，以及说明文字 caption）以文本形式告诉主 agent。
 /// 所有文件类消息的文本里都会带上消息 ID 以便追溯。
 /// 返回 None 表示既不是文本也不是受支持的文件类型（如贴纸等）。
 async fn build_user_message(
     bot: &Bot,
     msg: &Message,
+    session: &SessionFile,
     forward_to_vision: bool,
 ) -> Result<Option<RigMessage>, Box<dyn std::error::Error + Send + Sync>> {
     let msg_id = msg.id.0;
@@ -119,10 +110,11 @@ async fn build_user_message(
             };
             return Ok(Some(image_user_message(text, bytes, ImageMediaType::JPEG)));
         }
-        // 先压缩再存临时文件，vision 看图时就不用再压缩
-        let (bytes, media_type) = compress_image(bytes, ImageMediaType::JPEG);
-        let path = save_temp_image(msg, &bytes, ext_for_media_type(media_type)).await?;
-        return Ok(Some(temp_image_text_message(msg_id, caption, path)));
+        // 先压缩再存会话 media/ 目录，vision 看图时就不用再压缩
+        let (bytes, _media_type) = compress_image(bytes, ImageMediaType::JPEG);
+        let path = save_media_image(session, &bytes, "photo", "image/jpeg").await?;
+        let size = human_size(bytes.len() as u64);
+        return Ok(Some(media_image_text_message(msg_id, caption, path, size)));
     }
     if let Some(doc) = msg.document() {
         let mime = doc
@@ -130,6 +122,10 @@ async fn build_user_message(
             .as_ref()
             .map(|m| m.as_ref().to_string())
             .unwrap_or_default();
+        let name = doc
+            .file_name
+            .clone()
+            .unwrap_or_else(|| "未知文件".to_string());
         if let Some(media_type) = mime_to_image_media_type(&mime) {
             let bytes = download_file_bytes(bot, &doc.file.id).await?;
             let caption = msg.caption().map(str::to_string).unwrap_or_default();
@@ -141,31 +137,44 @@ async fn build_user_message(
                 };
                 return Ok(Some(image_user_message(text, bytes, media_type)));
             }
-            // 先压缩再存临时文件，vision 看图时就不用再压缩
-            let (bytes, media_type) = compress_image(bytes, media_type);
-            let path = save_temp_image(msg, &bytes, ext_for_media_type(media_type)).await?;
-            return Ok(Some(temp_image_text_message(msg_id, caption, path)));
+            // 先压缩再存会话 media/ 目录，vision 看图时就不用再压缩
+            let (bytes, _media_type) = compress_image(bytes, media_type);
+            let path = save_media_image(session, &bytes, &name, &mime).await?;
+            let size = human_size(bytes.len() as u64);
+            return Ok(Some(media_image_text_message(msg_id, caption, path, size)));
         }
-        // 非图片文档：只传元数据，不下载
-        let name = doc
-            .file_name
-            .clone()
-            .unwrap_or_else(|| "未知文件".to_string());
+        // 非图片文档：≤50MB 自动下载到会话 media/ 目录并告知路径，超限只传元数据
         let size = crate::tools::human_size(doc.file.size as u64);
+        let note = media_download_note(
+            bot,
+            session,
+            &doc.file.id,
+            &name,
+            &mime,
+            doc.file.size as u64,
+        )
+        .await;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
         return Ok(Some(text_user_message(with_caption(
-            format!("用户发来一个文档 `{name}`(MIME: {mime}，大小 {size}，消息 ID {msg_id})"),
+            format!("用户发来一个文档 `{name}`(MIME: {mime}，大小 {size}，消息 ID {msg_id}){note}"),
             &caption,
         ))));
     }
-    // 2. 视频 / 音频：同样只传元数据
+    // 2. 视频 / 音频：同样 ≤50MB 自动下载，超限只传元数据
     if let Some(v) = msg.video() {
         let name = v.file_name.clone().unwrap_or_else(|| "视频".to_string());
+        let mime = v
+            .mime_type
+            .as_ref()
+            .map(|m| m.as_ref().to_string())
+            .unwrap_or_else(|| "video/mp4".to_string());
         let size = crate::tools::human_size(v.file.size as u64);
+        let note =
+            media_download_note(bot, session, &v.file.id, &name, &mime, v.file.size as u64).await;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
         return Ok(Some(text_user_message(with_caption(
             format!(
-                "用户发来一个视频 `{name}`（大小 {size}，时长 {}s，消息 ID {msg_id}）",
+                "用户发来一个视频 `{name}`（大小 {size}，时长 {}s，消息 ID {msg_id}）{note}",
                 v.duration.seconds()
             ),
             &caption,
@@ -173,10 +182,17 @@ async fn build_user_message(
     }
     if let Some(a) = msg.audio() {
         let title = a.title.clone().unwrap_or_else(|| "音频".to_string());
+        let mime = a
+            .mime_type
+            .as_ref()
+            .map(|m| m.as_ref().to_string())
+            .unwrap_or_else(|| "audio/mpeg".to_string());
         let size = crate::tools::human_size(a.file.size as u64);
+        let note =
+            media_download_note(bot, session, &a.file.id, &title, &mime, a.file.size as u64).await;
         let caption = msg.caption().map(str::to_string).unwrap_or_default();
         return Ok(Some(text_user_message(with_caption(
-            format!("用户发来一段音频 `{title}`（大小 {size}，消息 ID {msg_id}）"),
+            format!("用户发来一段音频 `{title}`（大小 {size}，消息 ID {msg_id}）{note}"),
             &caption,
         ))));
     }
@@ -187,6 +203,108 @@ async fn build_user_message(
     }
 
     Ok(None)
+}
+
+/// 非图片文件消息（文档/视频/音频）的自动下载处理：
+/// ≤ 50MB 时把文件体下载到会话 media/ 目录，返回要附到消息文本末尾的提示
+/// （落盘路径 + 实际大小）；超限或下载失败则返回对应的说明文本。
+async fn media_download_note(
+    bot: &Bot,
+    session: &SessionFile,
+    file_id: &FileId,
+    name: &str,
+    mime: &str,
+    size: u64,
+) -> String {
+    if size > MAX_MEDIA_BYTES {
+        return format!(
+            "；超过 {} 的自动下载上限，未下载",
+            human_size(MAX_MEDIA_BYTES)
+        );
+    }
+    match download_media_file(bot, session, file_id, name, mime).await {
+        Ok(path) => format!(
+            "；已自动下载到 {}（大小 {}）",
+            path.display(),
+            human_size(size)
+        ),
+        Err(e) => {
+            tracing::warn!("用户发来的文件自动下载失败： {e}");
+            "；自动下载失败，需要时请让用户重发".to_string()
+        }
+    }
+}
+
+/// 下载文件到会话 media/ 目录，命名 `<uuid>-<原文件名>`（无扩展名时按 MIME 补上）。
+async fn download_media_file(
+    bot: &Bot,
+    session: &SessionFile,
+    file_id: &FileId,
+    name: &str,
+    mime: &str,
+) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = download_file_bytes(bot, file_id).await?;
+    let path = session.media_dir().join(media_file_name(name, mime));
+    tokio::fs::write(&path, &bytes).await?;
+    tracing::info!(
+        "用户发来的文件已存到： {}（{}）",
+        path.display(),
+        human_size(bytes.len() as u64)
+    );
+    Ok(path)
+}
+
+/// media/ 里的文件名：`<uuid>-<原文件名>`；原文件名去掉路径分隔符等不安全字符，
+/// 没有扩展名时按 MIME 推断一个。
+fn media_file_name(name: &str, mime: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\x00'..='\x1f' => '_',
+            c => c,
+        })
+        .collect();
+    let safe = safe.trim().to_string();
+    let base = if safe.is_empty() {
+        "file".to_string()
+    } else {
+        safe
+    };
+    let id = Uuid::new_v4();
+    if Path::new(&base).extension().is_some_and(|e| !e.is_empty()) {
+        format!("{id}-{base}")
+    } else {
+        format!("{id}-{base}.{}", ext_for_mime(mime))
+    }
+}
+
+/// 从 MIME 推断文件扩展名，无法识别时退回 bin。
+fn ext_for_mime(mime: &str) -> &'static str {
+    match mime.to_ascii_lowercase().as_str() {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/heic" => "heic",
+        "image/heif" => "heif",
+        "image/svg+xml" => "svg",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/webm" => "webm",
+        "audio/flac" => "flac",
+        "audio/wav" => "wav",
+        "video/mp4" => "mp4",
+        "video/quicktime" => "mov",
+        "video/webm" => "webm",
+        "video/x-matroska" => "mkv",
+        "application/pdf" => "pdf",
+        "application/zip" => "zip",
+        "application/gzip" | "application/x-gzip" => "gz",
+        "text/plain" => "txt",
+        "text/markdown" => "md",
+        "text/csv" => "csv",
+        _ => "bin",
+    }
 }
 
 /// 若消息带说明文字（caption），按图片消息的格式附到文本末尾。
@@ -413,30 +531,10 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         }
     }
 
-    // 构建发给模型的用户消息：纯文本，或图片（可带说明文字）
-    // forward_to_vision 且 vision 已启用时，图片转存临时文件并提示调 vision 工具；
-    // 否则（包括 vision 未启用的情况）图片原样内嵌发给上游
-    let forward_to_vision = state.forward_to_vision && state.vision_client.is_some();
-    let Some(user_msg) = build_user_message(&state.bot, &msg, forward_to_vision).await? else {
-        state
-            .bot
-            .send_message(msg.chat.id, "请发送文本、图片、文档、视频或音频 🙏")
-            .await?;
-        return Ok(());
-    };
-
-    tracing::info!(
-        "收到消息： chat={} user={:?} text={:?}",
-        msg.chat.id,
-        msg.from.as_ref().map(|f| f.id),
-        log_text,
-    );
-
     let chat_id = msg.chat.id;
 
-    // 本轮的 round id:journal 里关联本轮全部消息
-    let round_id = Uuid::new_v4();
-    // 当前会话文件：chat 还没有则新建（/new 或进程重启后都会是新文件）
+    // 当前会话文件：chat 还没有则新建（/new 或进程重启后都会是新文件）。
+    // 需先于 build_user_message 拿到：文件消息会自动下载到该会话的 media/ 目录
     let session = {
         let mut map = state.sessions.lock().await;
         match map.get(&chat_id).cloned() {
@@ -452,6 +550,30 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
             }
         }
     };
+
+    // 构建发给模型的用户消息：纯文本，或图片（可带说明文字）
+    // forward_to_vision 且 vision 已启用时，图片转存会话 media/ 目录并提示调 vision 工具；
+    // 否则（包括 vision 未启用的情况）图片原样内嵌发给上游；
+    // 非图片文件（文档/视频/音频）≤50MB 时自动下载到会话 media/ 目录并告知 agent
+    let forward_to_vision = state.forward_to_vision && state.vision_client.is_some();
+    let Some(user_msg) = build_user_message(&state.bot, &msg, &session, forward_to_vision).await?
+    else {
+        state
+            .bot
+            .send_message(chat_id, "请发送文本、图片、文档、视频或音频 🙏")
+            .await?;
+        return Ok(());
+    };
+
+    tracing::info!(
+        "收到消息： chat={} user={:?} text={:?}",
+        chat_id,
+        msg.from.as_ref().map(|f| f.id),
+        log_text,
+    );
+
+    // 本轮的 round id:journal 里关联本轮全部消息
+    let round_id = Uuid::new_v4();
     let agent = state.agent_for(chat_id, session.toolout_dir());
 
     // 流异常（拿不到 FinalResponse）时，至少把本轮用户消息记进 journal
@@ -820,5 +942,33 @@ mod tests {
         let (out, mt) = compress_image(small.clone(), ImageMediaType::PNG);
         assert_eq!(out, small);
         assert!(matches!(mt, ImageMediaType::PNG));
+    }
+
+    #[test]
+    fn media_file_name_keeps_original_and_prefixes_uuid() {
+        let name = media_file_name("hello.pdf", "application/pdf");
+        assert!(name.ends_with("-hello.pdf"));
+        let uuid_part = name.strip_suffix("-hello.pdf").unwrap();
+        assert!(Uuid::parse_str(uuid_part).is_ok());
+    }
+
+    #[test]
+    fn media_file_name_sanitizes_and_appends_mime_ext() {
+        // 路径分隔符等不安全字符被替换；无扩展名时按 MIME 补上
+        let name = media_file_name("a/b\nc.mp3", "audio/mpeg");
+        assert!(!name.contains(['/', '\\', '\n', '\r']));
+        assert!(name.ends_with("a_b_c.mp3"));
+        let noext = media_file_name("录音", "audio/mpeg");
+        assert!(noext.ends_with("录音.mp3"));
+        let empty = media_file_name("  ", "application/pdf");
+        assert!(empty.ends_with("file.pdf"));
+    }
+
+    #[test]
+    fn ext_for_mime_fallback() {
+        assert_eq!(ext_for_mime("image/png"), "png");
+        assert_eq!(ext_for_mime("audio/mpeg"), "mp3");
+        assert_eq!(ext_for_mime("video/MP4"), "mp4");
+        assert_eq!(ext_for_mime("application/x-unknown"), "bin");
     }
 }
