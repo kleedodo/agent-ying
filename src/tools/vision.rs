@@ -14,7 +14,7 @@ use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 
 use crate::approval::request_approval;
-use crate::handlers::compress_image;
+use crate::image::compress_image;
 
 use super::{ToolCtx, ToolErr, human_size, record_tool_result};
 

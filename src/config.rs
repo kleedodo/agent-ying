@@ -1,4 +1,4 @@
-//！ 配置：启动时确保 `~/.agent-ying/` 存在，没有 `config.json` 就写出默认模板，然后加载。
+//! 配置：启动时确保 `~/.agent-ying/` 存在，没有 `config.json` 就写出默认模板，然后加载。
 
 use std::fs;
 use std::path::PathBuf;

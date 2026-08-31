@@ -1,457 +1,25 @@
 //! Telegram 更新处理器：文本消息 → 跑 agent；按钮回调 → 决定工具审批。
 
-use std::path::{Path, PathBuf};
+use std::time::Duration;
 
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use futures::StreamExt;
-use rig::agent::{PromptResponse, StreamingError};
+use rig::agent::StreamingError;
 use rig::completion::Message as RigMessage;
-use rig::completion::message::{
-    DocumentSourceKind, Image as RigImage, ImageMediaType, Text as RigText, UserContent,
-};
 use rig::prelude::{MultiTurnStreamItem, StreamingChat};
 use rig::streaming::StreamedAssistantContent;
-
-use teloxide::net::Download;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, FileId, InlineKeyboardMarkup, MessageId};
+use teloxide::types::{ChatAction, ChatId, InlineKeyboardMarkup, MessageId};
+use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::{
     AppState,
     approval::{ResolveOutcome, approval_body},
     journal::SessionFile,
-    tools::human_size,
+    usermsg::build_user_message,
 };
 
 pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
-
-/// 把用户发来的图片存到会话 media/ 目录，命名 `<uuid>-<name>`
-async fn save_media_image(
-    session: &SessionFile,
-    bytes: &[u8],
-    name: &str,
-    mime: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let path = session.media_dir().join(media_file_name(name, mime));
-    tokio::fs::write(&path, bytes).await?;
-    tracing::info!(
-        "用户发来的图片已存到： {}（{}）",
-        path.display(),
-        human_size(bytes.len() as u64)
-    );
-    Ok(path)
-}
-
-/// 转发给 vision 时，图片对应的用户消息：
-/// 告诉主 agent 图片已存到哪个文件（及大小），请它调用 vision 工具查看；
-/// 同时带上消息 ID 以便追溯。
-fn media_image_text_message(
-    msg_id: i32,
-    caption: String,
-    path: PathBuf,
-    size: String,
-) -> RigMessage {
-    let text = if caption.trim().is_empty() {
-        format!(
-            "用户发来一张图片（消息 ID {msg_id}），已保存到 {}（大小 {size}），请用 vision 工具查看它。",
-            path.display()
-        )
-    } else {
-        format!(
-            "用户发来一张图片并附说明「{}」（消息 ID {msg_id}），图片已保存到 {}（大小 {size}），请用 vision 工具查看它。",
-            caption,
-            path.display()
-        )
-    };
-    RigMessage::User {
-        content: vec![UserContent::Text(RigText {
-            text,
-            additional_params: None,
-        })],
-    }
-}
-
-/// 用户发来的文件自动下载上限：50MB
-const MAX_MEDIA_BYTES: u64 = 50 * 1024 * 1024;
-
-/// 从 Telegram 消息构建发给模型的用户消息。
-/// 支持：图片（photo，或 image/* 的 document，可带说明文字）、文档、视频、音频、纯文本。
-/// 图片：`forward_to_vision` 为 true 时存到会话 media/ 目录并用文本提示主 agent 调 vision 工具；
-/// 否则直接内嵌、原样发给上游。
-/// 文档/视频/音频：≤ 50MB 时自动下载到会话的 media/ 目录，并把落盘路径与大小告诉主 agent；
-/// 超过 50MB 只把元数据（文件名、大小、消息 ID，以及说明文字 caption）以文本形式告诉主 agent。
-/// 所有文件类消息的文本里都会带上消息 ID 以便追溯。
-/// 返回 None 表示既不是文本也不是受支持的文件类型（如贴纸等）。
-async fn build_user_message(
-    bot: &Bot,
-    msg: &Message,
-    session: &SessionFile,
-    forward_to_vision: bool,
-) -> Result<Option<RigMessage>, Box<dyn std::error::Error + Send + Sync>> {
-    let msg_id = msg.id.0;
-    // 1. 图片：photo 优先（总是 JPEG），其次 image/* 的 document
-    // Telegram 的 photo 带多档尺寸，取宽度 ≤1080 的最大档省流量；没有则退回最大档
-    if let Some(photos) = msg.photo().as_ref()
-        && let Some(photo) = photos
-            .iter()
-            .rev()
-            .find(|p| p.width <= 1080)
-            .or_else(|| photos.last())
-    {
-        let bytes = download_file_bytes(bot, &photo.file.id).await?;
-        let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        if !forward_to_vision {
-            let text = if caption.trim().is_empty() {
-                format!("（用户发了一张图片，消息 ID {msg_id}）")
-            } else {
-                format!("{caption}（消息 ID {msg_id}）")
-            };
-            return Ok(Some(image_user_message(text, bytes, ImageMediaType::JPEG)));
-        }
-        // 先压缩再存会话 media/ 目录，vision 看图时就不用再压缩
-        let (bytes, _media_type) = compress_image(bytes, ImageMediaType::JPEG);
-        let path = save_media_image(session, &bytes, "photo", "image/jpeg").await?;
-        let size = human_size(bytes.len() as u64);
-        return Ok(Some(media_image_text_message(msg_id, caption, path, size)));
-    }
-    if let Some(doc) = msg.document() {
-        let mime = doc
-            .mime_type
-            .as_ref()
-            .map(|m| m.as_ref().to_string())
-            .unwrap_or_default();
-        let name = doc
-            .file_name
-            .clone()
-            .unwrap_or_else(|| "未知文件".to_string());
-        if let Some(media_type) = mime_to_image_media_type(&mime) {
-            let bytes = download_file_bytes(bot, &doc.file.id).await?;
-            let caption = msg.caption().map(str::to_string).unwrap_or_default();
-            if !forward_to_vision {
-                let text = if caption.trim().is_empty() {
-                    format!("（用户发了一张图片，消息 ID {msg_id}）")
-                } else {
-                    format!("{caption}（消息 ID {msg_id}）")
-                };
-                return Ok(Some(image_user_message(text, bytes, media_type)));
-            }
-            // 先压缩再存会话 media/ 目录，vision 看图时就不用再压缩
-            let (bytes, _media_type) = compress_image(bytes, media_type);
-            let path = save_media_image(session, &bytes, &name, &mime).await?;
-            let size = human_size(bytes.len() as u64);
-            return Ok(Some(media_image_text_message(msg_id, caption, path, size)));
-        }
-        // 非图片文档：≤50MB 自动下载到会话 media/ 目录并告知路径，超限只传元数据
-        let size = crate::tools::human_size(doc.file.size as u64);
-        let note = media_download_note(
-            bot,
-            session,
-            &doc.file.id,
-            &name,
-            &mime,
-            doc.file.size as u64,
-        )
-        .await;
-        let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        return Ok(Some(text_user_message(with_caption(
-            format!("用户发来一个文档 `{name}`(MIME: {mime}，大小 {size}，消息 ID {msg_id}){note}"),
-            &caption,
-        ))));
-    }
-    // 2. 视频 / 音频：同样 ≤50MB 自动下载，超限只传元数据
-    if let Some(v) = msg.video() {
-        let name = v.file_name.clone().unwrap_or_else(|| "视频".to_string());
-        let mime = v
-            .mime_type
-            .as_ref()
-            .map(|m| m.as_ref().to_string())
-            .unwrap_or_else(|| "video/mp4".to_string());
-        let size = crate::tools::human_size(v.file.size as u64);
-        let note =
-            media_download_note(bot, session, &v.file.id, &name, &mime, v.file.size as u64).await;
-        let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        return Ok(Some(text_user_message(with_caption(
-            format!(
-                "用户发来一个视频 `{name}`（大小 {size}，时长 {}s，消息 ID {msg_id}）{note}",
-                v.duration.seconds()
-            ),
-            &caption,
-        ))));
-    }
-    if let Some(a) = msg.audio() {
-        let title = a.title.clone().unwrap_or_else(|| "音频".to_string());
-        let mime = a
-            .mime_type
-            .as_ref()
-            .map(|m| m.as_ref().to_string())
-            .unwrap_or_else(|| "audio/mpeg".to_string());
-        let size = crate::tools::human_size(a.file.size as u64);
-        let note =
-            media_download_note(bot, session, &a.file.id, &title, &mime, a.file.size as u64).await;
-        let caption = msg.caption().map(str::to_string).unwrap_or_default();
-        return Ok(Some(text_user_message(with_caption(
-            format!("用户发来一段音频 `{title}`（大小 {size}，消息 ID {msg_id}）{note}"),
-            &caption,
-        ))));
-    }
-
-    // 3. 纯文本
-    if let Some(text) = msg.text().map(str::to_owned) {
-        return Ok(Some(text_user_message(text)));
-    }
-
-    Ok(None)
-}
-
-/// 非图片文件消息（文档/视频/音频）的自动下载处理：
-/// ≤ 50MB 时把文件体下载到会话 media/ 目录，返回要附到消息文本末尾的提示
-/// （落盘路径 + 实际大小）；超限或下载失败则返回对应的说明文本。
-async fn media_download_note(
-    bot: &Bot,
-    session: &SessionFile,
-    file_id: &FileId,
-    name: &str,
-    mime: &str,
-    size: u64,
-) -> String {
-    if size > MAX_MEDIA_BYTES {
-        return format!(
-            "；超过 {} 的自动下载上限，未下载",
-            human_size(MAX_MEDIA_BYTES)
-        );
-    }
-    match download_media_file(bot, session, file_id, name, mime).await {
-        Ok(path) => format!(
-            "；已自动下载到 {}（大小 {}）",
-            path.display(),
-            human_size(size)
-        ),
-        Err(e) => {
-            tracing::warn!("用户发来的文件自动下载失败： {e}");
-            "；自动下载失败，需要时请让用户重发".to_string()
-        }
-    }
-}
-
-/// 下载文件到会话 media/ 目录，命名 `<uuid>-<原文件名>`（无扩展名时按 MIME 补上）。
-async fn download_media_file(
-    bot: &Bot,
-    session: &SessionFile,
-    file_id: &FileId,
-    name: &str,
-    mime: &str,
-) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
-    let bytes = download_file_bytes(bot, file_id).await?;
-    let path = session.media_dir().join(media_file_name(name, mime));
-    tokio::fs::write(&path, &bytes).await?;
-    tracing::info!(
-        "用户发来的文件已存到： {}（{}）",
-        path.display(),
-        human_size(bytes.len() as u64)
-    );
-    Ok(path)
-}
-
-/// media/ 里的文件名：`<uuid>-<原文件名>`；原文件名去掉路径分隔符等不安全字符，
-/// 没有扩展名时按 MIME 推断一个。
-fn media_file_name(name: &str, mime: &str) -> String {
-    let safe: String = name
-        .chars()
-        .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\x00'..='\x1f' => '_',
-            c => c,
-        })
-        .collect();
-    let safe = safe.trim().to_string();
-    let base = if safe.is_empty() {
-        "file".to_string()
-    } else {
-        safe
-    };
-    let id = Uuid::new_v4();
-    if Path::new(&base).extension().is_some_and(|e| !e.is_empty()) {
-        format!("{id}-{base}")
-    } else {
-        format!("{id}-{base}.{}", ext_for_mime(mime))
-    }
-}
-
-/// 从 MIME 推断文件扩展名，无法识别时退回 bin。
-fn ext_for_mime(mime: &str) -> &'static str {
-    match mime.to_ascii_lowercase().as_str() {
-        "image/jpeg" | "image/jpg" => "jpg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        "image/heic" => "heic",
-        "image/heif" => "heif",
-        "image/svg+xml" => "svg",
-        "audio/mpeg" | "audio/mp3" => "mp3",
-        "audio/ogg" => "ogg",
-        "audio/webm" => "webm",
-        "audio/flac" => "flac",
-        "audio/wav" => "wav",
-        "video/mp4" => "mp4",
-        "video/quicktime" => "mov",
-        "video/webm" => "webm",
-        "video/x-matroska" => "mkv",
-        "application/pdf" => "pdf",
-        "application/zip" => "zip",
-        "application/gzip" | "application/x-gzip" => "gz",
-        "text/plain" => "txt",
-        "text/markdown" => "md",
-        "text/csv" => "csv",
-        _ => "bin",
-    }
-}
-
-/// 若消息带说明文字（caption），按图片消息的格式附到文本末尾。
-fn with_caption(text: String, caption: &str) -> String {
-    if caption.trim().is_empty() {
-        text
-    } else {
-        format!("{text}，并附说明「{caption}」")
-    }
-}
-
-/// 构造纯文本用户消息。
-fn text_user_message(text: String) -> RigMessage {
-    RigMessage::User {
-        content: vec![UserContent::Text(RigText {
-            text,
-            additional_params: None,
-        })],
-    }
-}
-
-/// 下载 Telegram 文件为字节。
-pub(crate) async fn download_file_bytes(
-    bot: &Bot,
-    file_id: &FileId,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let file = bot.get_file(file_id.clone()).await?;
-    let mut buf: Vec<u8> = Vec::new();
-    bot.download_file(&file.path, &mut buf).await?;
-    Ok(buf)
-}
-
-/// 大图压缩上限：256KB。超过则重编码为 JPEG 并逐步降质/缩小，直到不超过该值。
-const MAX_IMAGE_BYTES: usize = 256 * 1024;
-
-/// 若图片超过 256KB，则解码后重编码为 JPEG，逐步降低质量与尺寸，直到不超过上限。
-/// 返回 （新字节， 对应 media_type）。未超限时原样返回。
-pub(crate) fn compress_image(
-    bytes: Vec<u8>,
-    media_type: ImageMediaType,
-) -> (Vec<u8>, ImageMediaType) {
-    if bytes.len() <= MAX_IMAGE_BYTES {
-        return (bytes, media_type);
-    }
-
-    let Ok(img) = image::load_from_memory(&bytes) else {
-        // 解不了（如未启用解码器的 heic/svg），退而求其次：原样返回
-        return (bytes, media_type);
-    };
-
-    let base_w = img.width() as f64;
-    let base_h = img.height() as f64;
-
-    // 从大到小尝试：每个尺寸只缩放/转换一次，再在该尺寸上依次降质量。
-    // 这样避免对同一尺寸反复做昂贵的重采样。
-    for scale in [1.0f64, 0.85, 0.7, 0.55, 0.4, 0.3, 0.2] {
-        let rgb = if scale >= 1.0 {
-            to_rgb8_white_bg(&img)
-        } else {
-            let w = (base_w * scale).max(1.0) as u32;
-            let h = (base_h * scale).max(1.0) as u32;
-            // Triangle 滤镜比 Lanczos3 快得多，对喂给视觉模型已足够
-            let resized = img.resize_exact(w, h, image::imageops::FilterType::Triangle);
-            to_rgb8_white_bg(&resized)
-        };
-        for quality in [85u8, 75, 65, 55, 45, 35] {
-            let mut buf = Vec::new();
-            let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality);
-            if encoder.encode_image(&rgb).is_ok() && buf.len() <= MAX_IMAGE_BYTES {
-                return (buf, ImageMediaType::JPEG);
-            }
-        }
-    }
-
-    // 兜底：最小尺寸最低质量（几乎不可能还超，但保证有返回值）
-    let rgb = to_rgb8_white_bg(&img.resize_exact(64, 64, image::imageops::FilterType::Triangle));
-    let mut buf = Vec::new();
-    let mut encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, 30);
-    encoder.encode_image(&rgb).ok();
-    (buf, ImageMediaType::JPEG)
-}
-
-/// 转成 RGB8；带透明通道（PNG 等）时合成到白底，避免透明区变黑。
-fn to_rgb8_white_bg(img: &image::DynamicImage) -> image::RgbImage {
-    match img {
-        image::DynamicImage::ImageRgba8(rgba) => {
-            let mut out = image::RgbImage::new(rgba.width(), rgba.height());
-            for (x, y, px) in rgba.enumerate_pixels() {
-                let a = px[3] as f32 / 255.0;
-                let r = (px[0] as f32 * a + 255.0 * (1.0 - a)) as u8;
-                let g = (px[1] as f32 * a + 255.0 * (1.0 - a)) as u8;
-                let b = (px[2] as f32 * a + 255.0 * (1.0 - a)) as u8;
-                out.put_pixel(x, y, image::Rgb([r, g, b]));
-            }
-            out
-        }
-        other => other.to_rgb8(),
-    }
-}
-
-/// 把 Telegram 的 MIME 字符串映射到 rig 支持的图片类型，不支持返回 None。
-fn mime_to_image_media_type(mime: &str) -> Option<ImageMediaType> {
-    match mime.to_ascii_lowercase().as_str() {
-        "image/jpeg" | "image/jpg" => Some(ImageMediaType::JPEG),
-        "image/png" => Some(ImageMediaType::PNG),
-        "image/gif" => Some(ImageMediaType::GIF),
-        "image/webp" => Some(ImageMediaType::WEBP),
-        "image/heic" => Some(ImageMediaType::HEIC),
-        "image/heif" => Some(ImageMediaType::HEIF),
-        "image/svg+xml" => Some(ImageMediaType::SVG),
-        _ => None,
-    }
-}
-
-/// 构造「说明文字 + 图片」的用户消息。
-fn image_user_message(text: String, bytes: Vec<u8>, media_type: ImageMediaType) -> RigMessage {
-    // 大图先压缩到 256KB 以下，再 base64
-    let (bytes, media_type) = compress_image(bytes, media_type);
-    let b64 = BASE64.encode(&bytes);
-    let image = UserContent::Image(RigImage {
-        data: DocumentSourceKind::base64(&b64),
-        media_type: Some(media_type),
-        detail: None,
-        additional_params: None,
-    });
-    let content = vec![
-        UserContent::Text(RigText {
-            text,
-            additional_params: None,
-        }),
-        image,
-    ];
-    RigMessage::User { content }
-}
-
-/// 计算下一次流式编辑前的随机等待时长：
-/// 在 `200ms ~ interval` 内均匀随机；`interval` 小于 200ms 时按 200ms 执行。
-fn random_edit_wait(interval: std::time::Duration) -> std::time::Duration {
-    use std::time::Duration;
-    const FLOOR: Duration = Duration::from_millis(200);
-    let ceiling = interval.max(FLOOR);
-    if ceiling == FLOOR {
-        return FLOOR;
-    }
-    let range_ms = ceiling.as_millis() as u64 - FLOOR.as_millis() as u64;
-    FLOOR + Duration::from_millis(rand::random::<u64>() % (range_ms + 1))
-}
 
 /// 处理用户发来的文本消息：跑一轮 agent 对话（带多轮历史）。
 pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
@@ -471,67 +39,18 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         return Ok(());
     }
 
+    let chat_id = msg.chat.id;
     let text = msg.text().map(str::to_owned);
+
     // 文件类消息没有 text，日志里改打 caption；没有 caption 则打 [XX消息] 占位
-    let log_text = text.clone().or_else(|| {
-        let caption = msg
-            .caption()
-            .map(str::to_string)
-            .filter(|c| !c.trim().is_empty());
-        let is_image = msg.photo().is_some()
-            || msg.document().as_ref().is_some_and(|d| {
-                d.mime_type
-                    .as_ref()
-                    .is_some_and(|m| m.to_string().starts_with("image/"))
-            });
-        if is_image {
-            caption.or_else(|| Some("[图片消息]".to_string()))
-        } else if let Some(doc) = msg.document() {
-            caption.or_else(|| {
-                Some(format!(
-                    "[文档消息] {}",
-                    doc.file_name.clone().unwrap_or_default()
-                ))
-            })
-        } else if msg.video().is_some() {
-            caption.or_else(|| Some("[视频消息]".to_string()))
-        } else if msg.audio().is_some() {
-            caption.or_else(|| Some("[音频消息]".to_string()))
-        } else {
-            None
-        }
-    });
+    let log_text = text.clone().or_else(|| describe_for_log(&msg));
 
     // 简单的 /start、/help、/new 命令（文本消息）
-    if let Some(t) = &text {
-        if t.starts_with("/start") || t.starts_with("/help") {
-            state
-                .bot
-                .send_message(
-                    msg.chat.id,
-                    "👋 我是 ying！直接发文本或图片就行。\n\
-                     我可以用 `bash` 跑命令、`read` 读文件，\n\
-                     也能看你发的图片、看电脑上的图片（vision）。\n\
-                     每次调用工具前都会发按钮请你明确同意。\n\
-                     发送 /new 可以开启新会话（清空对话历史）。",
-                )
-                .await?;
-            return Ok(());
-        }
-        if t.starts_with("/new") {
-            let mut map = state.histories.lock().await;
-            map.remove(&msg.chat.id);
-            // 会话结束：下一条消息会创建新的会话文件
-            state.sessions.lock().await.remove(&msg.chat.id);
-            state
-                .bot
-                .send_message(msg.chat.id, "🆕 新会话已开始，之前的对话历史已清空。")
-                .await?;
-            return Ok(());
-        }
+    if let Some(t) = &text
+        && handle_command(&state, chat_id, t).await?
+    {
+        return Ok(());
     }
-
-    let chat_id = msg.chat.id;
 
     // 当前会话文件：chat 还没有则新建（/new 或进程重启后都会是新文件）。
     // 需先于 build_user_message 拿到：文件消息会自动下载到该会话的 media/ 目录
@@ -579,20 +98,14 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     // 流异常（拿不到 FinalResponse）时，至少把本轮用户消息记进 journal
     let logged_user_msg = user_msg.clone();
 
-    // 先发「正在输入」状态，让用户立刻有反馈；
-    // 占位消息改为每轮首个文本到达时懒创建（见下方 placeholder）
+    // 先发「正在输入」状态，让用户立刻有反馈
     let _ = state
         .bot
         .send_chat_action(chat_id, ChatAction::Typing)
         .await;
 
-    // 占位消息始终代表「当前正在生成的回复」:
-    // 每轮首个文本到达时创建，工具调用时定稿/删除，
-    // 这样最终回复始终位于所有工具审批消息之后，不会被「顶上去」
-    let mut placeholder: Option<MessageId> = None;
-
     // 每个 chat 单独维护多轮对话历史（先取出再写回）
-    let mut history: Vec<RigMessage> = {
+    let history: Vec<RigMessage> = {
         let map = state.histories.lock().await;
         map.get(&chat_id).cloned().unwrap_or_default()
     };
@@ -600,177 +113,344 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     // 流式跑 agent：文本增量实时刷到占位消息（节流防触发 Telegram 限频）,
     // 最终回复与本轮新增历史以 FinalResponse 为准
     let mut stream = agent.stream_chat(user_msg, history.clone()).await;
+    let mut collector = StreamCollector::new(
+        state.bot.clone(),
+        chat_id,
+        state.stream_edit_interval,
+        history,
+    );
 
-    let mut preview = String::new();
-    let mut preview_sent = String::new();
-    let mut last_edit = tokio::time::Instant::now();
-    let mut next_wait = random_edit_wait(state.stream_edit_interval);
-    let mut final_response: Option<PromptResponse> = None;
-    let mut stream_error: Option<StreamingError> = None;
-
-    while let Some(item) = stream.next().await {
-        match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                preview.push_str(&text.text);
-                // 新一轮的首个文本（首轮，或工具调用之后）：先新建占位消息
-                if placeholder.is_none() {
-                    match state.bot.send_message(chat_id, "🤔 思考中…").await {
-                        Ok(m) => placeholder = Some(m.id),
-                        Err(e) => tracing::warn!("占位消息发送失败（下个文本再试）: {e}"),
-                    }
-                }
-                // 节流：距上次编辑不足随机等待时长就先攒着，最后统一补发
-                if let Some(pid) = placeholder
-                    && last_edit.elapsed() >= next_wait
-                {
-                    match state
-                        .bot
-                        .edit_message_text(chat_id, pid, preview.clone())
-                        .await
-                    {
-                        Ok(_) => {
-                            preview_sent = preview.clone();
-                            last_edit = tokio::time::Instant::now();
-                            next_wait = random_edit_wait(state.stream_edit_interval);
-                        }
-                        Err(e) => tracing::warn!("流式更新消息失败（继续尝试）: {e}"),
-                    }
-                }
-            }
-            // 模型发起工具调用：之前的文本是中间轮次的输出。
-            // 占位消息有内容则定稿（补发节流余量并标记为中间输出），空则删除，
-            // 让后续审批消息与最终回复都排在它之后
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
-                ..
-            })) => {
-                if let Some(pid) = placeholder.take() {
-                    if preview.trim().is_empty() {
-                        if let Err(e) = state.bot.delete_message(chat_id, pid).await {
-                            tracing::warn!("删除占位消息失败： {e}");
-                        }
-                    } else if let Err(e) = state
-                        .bot
-                        .edit_message_text(chat_id, pid, format!("📝 {preview}"))
-                        .await
-                    {
-                        tracing::warn!("中间输出定稿失败： {e}");
-                    }
-                }
-                preview.clear();
-                preview_sent.clear();
-            }
-            // 该轮被 hook 拒绝重试：临时文本作废，占位消息一并删除，新一轮文本会重建
-            Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {
-                if let Some(pid) = placeholder.take()
-                    && let Err(e) = state.bot.delete_message(chat_id, pid).await
-                {
-                    tracing::warn!("删除占位消息失败： {e}");
-                }
-                preview.clear();
-                preview_sent.clear();
-            }
-            Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
-                final_response = Some(resp);
-            }
-            Ok(_) => {}
-            Err(e) => {
-                stream_error = Some(e);
-                break;
-            }
+    let terminal = loop {
+        let Some(item) = stream.next().await else {
+            break StreamTerminal::Ended;
+        };
+        if let Some(t) = collector.handle(item).await {
+            break t;
         }
-    }
+    };
 
-    let reply = match (stream_error, final_response) {
-        (Some(e), _) => {
+    // 收尾：按流的终态决定回复文本；异常轮次只记用户消息并提前结束
+    let reply = match terminal {
+        StreamTerminal::Finished => {
+            tracing::info!(
+                "Agent 回复完成： chat={} 共 {} 轮历史",
+                chat_id,
+                collector.history.len()
+            );
+            // 本轮全部消息追加进 journal（只追加、不修改）
+            session
+                .append_round(round_id, &collector.new_messages)
+                .await;
+            collector.take_final_output()
+        }
+        StreamTerminal::Error(e) => {
             tracing::error!("Agent 出错： chat={} {e}", chat_id);
-            // 占位消息还是空的就删掉，避免残留「思考中…」
-            if let Some(pid) = placeholder.take()
-                && preview.trim().is_empty()
-            {
-                let _ = state.bot.delete_message(chat_id, pid).await;
-            }
+            collector.cleanup_empty_placeholder().await;
             state
                 .bot
                 .send_message(chat_id, format!("⚠️ Agent 出错： {e}"))
                 .await?;
-            // 异常轮次只记用户消息
-            session
-                .append_round(round_id, std::slice::from_ref(&logged_user_msg))
-                .await;
+            record_abnormal_round(&session, round_id, &logged_user_msg).await;
             // 本轮收尾：审批日志消息追加「🏁 本轮结束」尾注（本轮无审批则不做任何事）
             state.approvals.finish_run(&state.bot, chat_id).await;
             return Ok(());
         }
-        (None, Some(resp)) => {
-            // resp.messages 是本轮新增消息（含用户输入），接在旧历史后面
-            let new_messages = resp.messages.unwrap_or_default();
-            history.extend(new_messages.clone());
-            // 本轮全部消息追加进 journal（只追加、不修改）
-            session.append_round(round_id, &new_messages).await;
-            resp.output
+        // 流结束却没收到 FinalResponse（异常）：有预览文本就保留，否则报错
+        StreamTerminal::Ended if collector.preview.trim().is_empty() => {
+            collector.delete_placeholder().await;
+            state
+                .bot
+                .send_message(chat_id, "⚠️ Agent 出错： 流结束但没有最终响应")
+                .await?;
+            record_abnormal_round(&session, round_id, &logged_user_msg).await;
+            state.approvals.finish_run(&state.bot, chat_id).await;
+            return Ok(());
         }
-        (None, None) => {
-            // 流结束却没收到 FinalResponse（异常）：有预览文本就保留，否则报错
-            if preview.is_empty() {
-                // 删掉占位消息，避免残留「思考中…」
-                if let Some(pid) = placeholder.take() {
-                    let _ = state.bot.delete_message(chat_id, pid).await;
-                }
-                state
-                    .bot
-                    .send_message(chat_id, "⚠️ Agent 出错： 流结束但没有最终响应")
-                    .await?;
-                // 异常轮次只记用户消息
-                session
-                    .append_round(round_id, std::slice::from_ref(&logged_user_msg))
-                    .await;
-                state.approvals.finish_run(&state.bot, chat_id).await;
-                return Ok(());
-            }
-            preview.clone()
-        }
+        StreamTerminal::Ended => collector.preview.clone(),
     };
 
-    tracing::info!(
-        "Agent 回复完成： chat={} 共 {} 轮历史",
-        chat_id,
-        history.len()
-    );
-
-    // 收尾：最终回复写入当前占位消息（与最后一次预览相同则跳过，
+    // 最终回复写入当前占位消息（与最后一次预览相同则跳过，
     // Telegram 对相同文本的编辑会报错）；没有占位（异常）则新发一条；
     // 回复为空则删掉占位，避免残留「思考中…」
-    match placeholder {
-        Some(pid) if !reply.is_empty() && reply != preview_sent => {
-            state.bot.edit_message_text(chat_id, pid, reply).await?;
-        }
-        None if !reply.is_empty() => {
-            state.bot.send_message(chat_id, reply).await?;
-        }
-        Some(pid) if reply.is_empty() => {
-            let _ = state.bot.delete_message(chat_id, pid).await;
-        }
-        _ => {}
-    }
+    collector.write_final(&reply).await?;
 
     // 本轮收尾：审批日志消息追加「🏁 本轮结束」尾注（本轮无审批则不做任何事）
     state.approvals.finish_run(&state.bot, chat_id).await;
 
     {
         let mut map = state.histories.lock().await;
-        map.insert(chat_id, history);
+        map.insert(chat_id, collector.history);
     }
     Ok(())
 }
 
-/// 兜底分支：打印没被上面任何 handler 匹配的 update，方便排查丢失的回调等。
-pub async fn on_unmatched(update: Update) -> HandlerResult {
-    tracing::info!(
-        "收到未匹配的 update: id={} kind={:?}",
-        update.id.0,
-        update.kind
-    );
-    Ok(())
+/// 简单的 /start、/help、/new 命令（文本消息）；返回 true 表示已处理、无需跑 agent
+async fn handle_command(
+    state: &AppState,
+    chat_id: ChatId,
+    text: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    if text.starts_with("/start") || text.starts_with("/help") {
+        state
+            .bot
+            .send_message(
+                chat_id,
+                "👋 我是 ying！直接发文本或图片就行。\n\
+                 我可以用 `bash` 跑命令、`read` 读文件，\n\
+                 也能看你发的图片、看电脑上的图片（vision）。\n\
+                 每次调用工具前都会发按钮请你明确同意。\n\
+                 发送 /new 可以开启新会话（清空对话历史）。",
+            )
+            .await?;
+        return Ok(true);
+    }
+    if text.starts_with("/new") {
+        state.histories.lock().await.remove(&chat_id);
+        // 会话结束：下一条消息会创建新的会话文件
+        state.sessions.lock().await.remove(&chat_id);
+        state
+            .bot
+            .send_message(chat_id, "🆕 新会话已开始，之前的对话历史已清空。")
+            .await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// 非文本消息的日志文案：优先 caption，没有则打 [XX消息] 占位
+fn describe_for_log(msg: &Message) -> Option<String> {
+    let caption = msg
+        .caption()
+        .map(str::to_string)
+        .filter(|c| !c.trim().is_empty());
+    let is_image = msg.photo().is_some()
+        || msg.document().as_ref().is_some_and(|d| {
+            d.mime_type
+                .as_ref()
+                .is_some_and(|m| m.to_string().starts_with("image/"))
+        });
+    if is_image {
+        caption.or_else(|| Some("[图片消息]".to_string()))
+    } else if let Some(doc) = msg.document() {
+        caption.or_else(|| {
+            Some(format!(
+                "[文档消息] {}",
+                doc.file_name.clone().unwrap_or_default()
+            ))
+        })
+    } else if msg.video().is_some() {
+        caption.or_else(|| Some("[视频消息]".to_string()))
+    } else if msg.audio().is_some() {
+        caption.or_else(|| Some("[音频消息]".to_string()))
+    } else {
+        None
+    }
+}
+
+/// 异常轮次的 journal 记录：只记本轮用户消息
+async fn record_abnormal_round(session: &SessionFile, round_id: Uuid, user_msg: &RigMessage) {
+    session
+        .append_round(round_id, std::slice::from_ref(user_msg))
+        .await;
+}
+
+/// 流的终态：拿到最终响应 / 流出错 / 流结束但没有 FinalResponse（异常）
+enum StreamTerminal {
+    Finished,
+    Error(String),
+    Ended,
+}
+
+/// 流式回复收集器：
+/// 占位消息始终代表「当前正在生成的回复」——每轮首个文本到达时创建，
+/// 工具调用时定稿/删除、hook 拒绝重试时删除，
+/// 这样最终回复始终位于所有工具审批消息之后，不会被「顶上去」。
+/// 文本增量按随机间隔节流刷到占位消息（防触发 Telegram 限频）。
+struct StreamCollector {
+    bot: Bot,
+    chat_id: ChatId,
+    edit_interval: Duration,
+    /// 多轮对话历史：FinalResponse 到达时把本轮新增消息接在后面
+    history: Vec<RigMessage>,
+    placeholder: Option<MessageId>,
+    /// 本轮已累积的临时文本
+    preview: String,
+    /// 已推到占位消息的文本（收尾时据此判断是否需要再编辑一次）
+    preview_sent: String,
+    last_edit: Instant,
+    next_wait: Duration,
+    /// FinalResponse 的最终回复文本
+    final_output: Option<String>,
+    /// FinalResponse 携带的本轮新增消息（含用户输入）
+    new_messages: Vec<RigMessage>,
+}
+
+impl StreamCollector {
+    fn new(bot: Bot, chat_id: ChatId, edit_interval: Duration, history: Vec<RigMessage>) -> Self {
+        let next_wait = random_edit_wait(edit_interval);
+        Self {
+            bot,
+            chat_id,
+            edit_interval,
+            history,
+            placeholder: None,
+            preview: String::new(),
+            preview_sent: String::new(),
+            last_edit: Instant::now(),
+            next_wait,
+            final_output: None,
+            new_messages: Vec::new(),
+        }
+    }
+
+    /// 处理一个流项；返回 Some 表示流到达终态
+    async fn handle(
+        &mut self,
+        item: Result<MultiTurnStreamItem, StreamingError>,
+    ) -> Option<StreamTerminal> {
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
+                self.push_text(text.text).await;
+                None
+            }
+            // 模型发起工具调用：之前的文本是中间轮次的输出，定稿/删除占位消息
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+                ..
+            })) => {
+                self.finalize_intermediate().await;
+                None
+            }
+            // 该轮被 hook 拒绝重试：临时文本作废，占位消息一并删除，新一轮文本会重建
+            Ok(MultiTurnStreamItem::ModelTurnRetried { .. }) => {
+                self.drop_placeholder().await;
+                None
+            }
+            Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
+                // resp.messages 是本轮新增消息（含用户输入），接在旧历史后面
+                self.new_messages = resp.messages.unwrap_or_default();
+                self.history.extend(self.new_messages.clone());
+                self.final_output = Some(resp.output);
+                Some(StreamTerminal::Finished)
+            }
+            Ok(_) => None,
+            Err(e) => Some(StreamTerminal::Error(e.to_string())),
+        }
+    }
+
+    /// 文本增量：懒创建占位消息，并按随机间隔节流刷到占位消息
+    async fn push_text(&mut self, text: String) {
+        self.preview.push_str(&text);
+        if self.placeholder.is_none() {
+            match self.bot.send_message(self.chat_id, "🤔 思考中…").await {
+                Ok(m) => self.placeholder = Some(m.id),
+                Err(e) => tracing::warn!("占位消息发送失败（下个文本再试）: {e}"),
+            }
+        }
+        // 节流：距上次编辑不足随机等待时长就先攒着，最后统一补发
+        if let Some(pid) = self.placeholder
+            && self.last_edit.elapsed() >= self.next_wait
+        {
+            match self
+                .bot
+                .edit_message_text(self.chat_id, pid, self.preview.clone())
+                .await
+            {
+                Ok(_) => {
+                    self.preview_sent = self.preview.clone();
+                    self.last_edit = Instant::now();
+                    self.next_wait = random_edit_wait(self.edit_interval);
+                }
+                Err(e) => tracing::warn!("流式更新消息失败（继续尝试）: {e}"),
+            }
+        }
+    }
+
+    /// 工具调用：占位消息有内容则定稿（补发节流余量并标记为中间输出），空则删除，
+    /// 让后续审批消息与最终回复都排在它之后
+    async fn finalize_intermediate(&mut self) {
+        if let Some(pid) = self.placeholder.take() {
+            if self.preview.trim().is_empty() {
+                if let Err(e) = self.bot.delete_message(self.chat_id, pid).await {
+                    tracing::warn!("删除占位消息失败： {e}");
+                }
+            } else if let Err(e) = self
+                .bot
+                .edit_message_text(self.chat_id, pid, format!("📝 {}", self.preview))
+                .await
+            {
+                tracing::warn!("中间输出定稿失败： {e}");
+            }
+        }
+        self.preview.clear();
+        self.preview_sent.clear();
+    }
+
+    /// 删除占位消息并清空临时文本
+    async fn drop_placeholder(&mut self) {
+        if let Some(pid) = self.placeholder.take()
+            && let Err(e) = self.bot.delete_message(self.chat_id, pid).await
+        {
+            tracing::warn!("删除占位消息失败： {e}");
+        }
+        self.preview.clear();
+        self.preview_sent.clear();
+    }
+
+    /// 取 FinalResponse 的最终回复（Finished 后调用）
+    fn take_final_output(&mut self) -> String {
+        self.final_output.take().unwrap_or_default()
+    }
+
+    /// 出错的占位消息还是空的就删掉，避免残留「思考中…」
+    async fn cleanup_empty_placeholder(&mut self) {
+        if let Some(pid) = self.placeholder.take()
+            && self.preview.trim().is_empty()
+        {
+            let _ = self.bot.delete_message(self.chat_id, pid).await;
+        }
+    }
+
+    /// 删掉占位消息（不管有没有内容）
+    async fn delete_placeholder(&mut self) {
+        if let Some(pid) = self.placeholder.take() {
+            let _ = self.bot.delete_message(self.chat_id, pid).await;
+        }
+    }
+
+    /// 最终回复写入当前占位消息（与最后一次预览相同则跳过，
+    /// Telegram 对相同文本的编辑会报错）；没有占位（异常）则新发一条；
+    /// 回复为空则删掉占位，避免残留「思考中…」
+    async fn write_final(&mut self, reply: &str) -> HandlerResult {
+        match self.placeholder {
+            Some(pid) if !reply.is_empty() && reply != self.preview_sent => {
+                self.bot
+                    .edit_message_text(self.chat_id, pid, reply.to_string())
+                    .await?;
+            }
+            None if !reply.is_empty() => {
+                self.bot
+                    .send_message(self.chat_id, reply.to_string())
+                    .await?;
+            }
+            Some(pid) if reply.is_empty() => {
+                let _ = self.bot.delete_message(self.chat_id, pid).await;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+/// 计算下一次流式编辑前的随机等待时长：
+/// 在 `200ms ~ interval` 内均匀随机；`interval` 小于 200ms 时按 200ms 执行。
+fn random_edit_wait(interval: Duration) -> Duration {
+    const FLOOR: Duration = Duration::from_millis(200);
+    let ceiling = interval.max(FLOOR);
+    if ceiling == FLOOR {
+        return FLOOR;
+    }
+    let range_ms = ceiling.as_millis() as u64 - FLOOR.as_millis() as u64;
+    FLOOR + Duration::from_millis(rand::random_range(0..=range_ms))
 }
 
 /// 把审批消息改成「已决定」状态时，保留原来的工具/命令信息，
@@ -876,10 +556,19 @@ pub async fn on_callback(state: AppState, q: CallbackQuery) -> HandlerResult {
     Ok(())
 }
 
+/// 兜底分支：打印没被上面任何 handler 匹配的 update，方便排查丢失的回调等。
+pub async fn on_unmatched(update: Update) -> HandlerResult {
+    tracing::info!(
+        "收到未匹配的 update: id={} kind={:?}",
+        update.id.0,
+        update.kind
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Duration;
 
     #[test]
     fn random_edit_wait_below_floor_clamps_to_200ms() {
@@ -900,75 +589,5 @@ mod tests {
             let w = random_edit_wait(ceiling);
             assert!((floor..=ceiling).contains(&w), "wait {w:?} 越界");
         }
-    }
-
-    /// 造一张高频噪点图，保证高质 JPEG 编码后远超 256KB。
-    fn noisy_jpeg(w: u32, h: u32, quality: u8) -> Vec<u8> {
-        let mut img = image::RgbImage::new(w, h);
-        for (x, y, px) in img.enumerate_pixels_mut() {
-            let v = (((x as u64) ^ (y as u64).wrapping_mul(2654435761)) % 256) as u8;
-            *px = image::Rgb([v, v.wrapping_add(1), v.wrapping_add(2)]);
-        }
-        let mut buf = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut buf, quality)
-            .encode_image(&img)
-            .unwrap();
-        buf
-    }
-
-    #[test]
-    fn large_image_compressed_under_limit() {
-        let orig = noisy_jpeg(1200, 1200, 95);
-        assert!(
-            orig.len() > MAX_IMAGE_BYTES,
-            "测试图应超 256KB，实际 {}",
-            crate::tools::human_size(orig.len() as u64)
-        );
-
-        let (out, mt) = compress_image(orig, ImageMediaType::JPEG);
-        assert!(
-            out.len() <= MAX_IMAGE_BYTES,
-            "压缩后 {} 仍超 256KB",
-            crate::tools::human_size(out.len() as u64)
-        );
-        assert!(matches!(mt, ImageMediaType::JPEG));
-        // 结果仍是合法图片
-        assert!(image::load_from_memory(&out).is_ok());
-    }
-
-    #[test]
-    fn small_image_passes_through_unchanged() {
-        let small = b"tiny-bytes-well-under-limit".to_vec();
-        let (out, mt) = compress_image(small.clone(), ImageMediaType::PNG);
-        assert_eq!(out, small);
-        assert!(matches!(mt, ImageMediaType::PNG));
-    }
-
-    #[test]
-    fn media_file_name_keeps_original_and_prefixes_uuid() {
-        let name = media_file_name("hello.pdf", "application/pdf");
-        assert!(name.ends_with("-hello.pdf"));
-        let uuid_part = name.strip_suffix("-hello.pdf").unwrap();
-        assert!(Uuid::parse_str(uuid_part).is_ok());
-    }
-
-    #[test]
-    fn media_file_name_sanitizes_and_appends_mime_ext() {
-        // 路径分隔符等不安全字符被替换；无扩展名时按 MIME 补上
-        let name = media_file_name("a/b\nc.mp3", "audio/mpeg");
-        assert!(!name.contains(['/', '\\', '\n', '\r']));
-        assert!(name.ends_with("a_b_c.mp3"));
-        let noext = media_file_name("录音", "audio/mpeg");
-        assert!(noext.ends_with("录音.mp3"));
-        let empty = media_file_name("  ", "application/pdf");
-        assert!(empty.ends_with("file.pdf"));
-    }
-
-    #[test]
-    fn ext_for_mime_fallback() {
-        assert_eq!(ext_for_mime("image/png"), "png");
-        assert_eq!(ext_for_mime("audio/mpeg"), "mp3");
-        assert_eq!(ext_for_mime("video/MP4"), "mp4");
-        assert_eq!(ext_for_mime("application/x-unknown"), "bin");
     }
 }

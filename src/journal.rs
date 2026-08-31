@@ -1,6 +1,6 @@
 //! journals：每轮的全部消息以 jsonl 追加写入（只追加、不修改），每个会话一个自包含目录。
 //!
-//！ 目录布局（`~/.agent-ying/journals/` 下）:
+//! 目录布局（`~/.agent-ying/journals/` 下）:
 //! ```text
 //! journals/
 //!   2026-08/                        # 按会话创建时的月份（YYYY-MM）分子目录
@@ -15,7 +15,7 @@
 //!         <uuid>-<原文件名>
 //! ```
 //!
-//！ 每行一条消息：`{"ts", "round", "seq", "msg"}`。
+//! 每行一条消息：`{"ts", "round", "seq", "msg"}`。
 //! - `round` 是本轮的 uuid（每次用户消息一个）,`seq` 是轮内序号
 //! - 工具结果文本完整写入 jsonl（即 agent 看到的内容；上游 record_tool_result
 //!   已把长输出限长到 ~9KB）；若文本里带保存位置，附 `result_ref` 指向 toolout/ 里的原始全文

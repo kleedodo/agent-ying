@@ -1,5 +1,5 @@
-//！ 编辑核心算法：
-//！ 换行符规范化、BOM 剥离、模糊匹配、多处替换应用、展示向 diff 生成。
+//! 编辑核心算法：
+//! 换行符规范化、BOM 剥离、模糊匹配、多处替换应用、展示向 diff 生成。
 
 use similar::{DiffTag, TextDiff};
 use unicode_normalization::UnicodeNormalization;

@@ -1,9 +1,12 @@
 mod approval;
 mod config;
 mod handlers;
+mod image;
 mod journal;
+mod media;
 mod skills;
 mod tools;
+mod usermsg;
 
 use std::collections::HashMap;
 use std::sync::Arc;

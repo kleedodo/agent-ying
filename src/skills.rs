@@ -1,7 +1,7 @@
-//！ 技能（skills）：扫描 `~/.agent-ying/skills/<name>/SKILL.md`。
+//! 技能（skills）：扫描 `~/.agent-ying/skills/<name>/SKILL.md`。
 //!
-//！ 渐进式披露：启动时只把每个 skill 的 name + description 拼进系统提示，
-//！ 模型判断任务匹配某个 skill 时，再用 read 工具读取完整 SKILL.md。
+//! 渐进式披露：启动时只把每个 skill 的 name + description 拼进系统提示，
+//! 模型判断任务匹配某个 skill 时，再用 read 工具读取完整 SKILL.md。
 
 use std::fs;
 use std::path::PathBuf;
