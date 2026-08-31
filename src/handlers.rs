@@ -12,13 +12,10 @@ use rig::completion::message::{
 };
 use rig::prelude::{MultiTurnStreamItem, StreamingChat};
 use rig::streaming::StreamedAssistantContent;
-use std::collections::VecDeque;
-use std::sync::Arc;
 
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, FileId, InlineKeyboardMarkup, MessageId};
-use tokio::sync::Mutex;
 
 use crate::{
     AppState,
@@ -53,7 +50,7 @@ async fn save_temp_image(
 
 /// 转发给 vision 时,图片对应的用户消息:
 /// 告诉主 agent 图片已存到哪个临时文件,请它调用 vision 工具查看;
-/// 同时带上消息 ID,用户要求保存原图时 agent 可据此调 save_incoming 工具。
+/// 同时带上消息 ID 以便追溯。
 fn temp_image_text_message(msg_id: i32, caption: String, path: PathBuf) -> RigMessage {
     let text = if caption.trim().is_empty() {
         format!(
@@ -93,8 +90,8 @@ fn ext_for_media_type(mt: ImageMediaType) -> &'static str {
 /// 图片:`forward_to_vision` 为 true 时存到临时文件并用文本提示主 agent 调 vision 工具;
 /// 否则直接内嵌、原样发给上游。
 /// 文档/视频/音频只把元数据(文件名、大小、消息 ID,以及说明文字 caption)以文本形式
-/// 告诉主 agent,不下载文件本体;用户明确要求保存时由 agent 调 save_incoming 工具原样下载。
-/// 所有文件类消息的文本里都会带上消息 ID,供 save_incoming 定位。
+/// 告诉主 agent,不下载文件本体。
+/// 所有文件类消息的文本里都会带上消息 ID 以便追溯。
 /// 返回 None 表示既不是文本也不是受支持的文件类型(如贴纸等)。
 async fn build_user_message(
     bot: &Bot,
@@ -148,7 +145,7 @@ async fn build_user_message(
             let path = save_temp_image(msg, &bytes, ext_for_media_type(media_type)).await?;
             return Ok(Some(temp_image_text_message(msg_id, caption, path)));
         }
-        // 非图片文档:只传元数据,不下载;用户要求保存时由 save_incoming 原样下载
+        // 非图片文档:只传元数据,不下载
         let name = doc
             .file_name
             .clone()
@@ -207,104 +204,6 @@ fn text_user_message(text: String) -> RigMessage {
             text,
             additional_params: None,
         })],
-    }
-}
-
-/// 从用户消息里提取的文件元数据(save_incoming 工具据此下载)。
-#[derive(Clone)]
-pub(crate) struct IncomingFile {
-    pub file_id: FileId,
-    pub file_name: Option<String>,
-    pub file_size: u64,
-    pub mime: Option<String>,
-    pub kind: &'static str,
-    /// 消息发送时间(unix 秒),用于收件箱文件名的时间戳前缀
-    pub date: i64,
-}
-
-/// 从消息中提取文件本体,优先级:视频 > 文档 > 音频 > 图片(photo 取最大档)。
-pub(crate) fn extract_incoming_file(msg: &Message) -> Option<IncomingFile> {
-    let date = msg.date.timestamp();
-    if let Some(v) = msg.video() {
-        return Some(IncomingFile {
-            file_id: v.file.id.clone(),
-            file_name: v.file_name.clone(),
-            file_size: v.file.size as u64,
-            mime: v.mime_type.as_ref().map(|m| m.as_ref().to_string()),
-            kind: "视频",
-            date,
-        });
-    }
-    if let Some(d) = msg.document() {
-        return Some(IncomingFile {
-            file_id: d.file.id.clone(),
-            file_name: d.file_name.clone(),
-            file_size: d.file.size as u64,
-            mime: d.mime_type.as_ref().map(|m| m.as_ref().to_string()),
-            kind: "文档",
-            date,
-        });
-    }
-    if let Some(a) = msg.audio() {
-        return Some(IncomingFile {
-            file_id: a.file.id.clone(),
-            file_name: a.file_name.clone(),
-            file_size: a.file.size as u64,
-            mime: a.mime_type.as_ref().map(|m| m.as_ref().to_string()),
-            kind: "音频",
-            date,
-        });
-    }
-    if let Some(photos) = msg.photo()
-        && let Some(p) = photos.last()
-    {
-        return Some(IncomingFile {
-            file_id: p.file.id.clone(),
-            file_name: None,
-            file_size: p.file.size as u64,
-            mime: None,
-            kind: "图片",
-            date,
-        });
-    }
-    None
-}
-
-/// 缓存上限:超过则丢弃最旧的条目。
-const INCOMING_FILE_CACHE_CAP: usize = 512;
-
-/// 用户发来的文件缓存:(chat_id, message_id) → 文件元数据。
-/// Bot API 没有按消息 ID 取消息的方法,所以消息进来时就记下元数据,
-/// save_incoming 工具收到 message_id 后查这里拿 file_id 去下载。
-/// 注意:缓存在内存里,bot 重启后之前收到的文件就查不到了。
-#[derive(Clone)]
-pub(crate) struct IncomingFileCache {
-    inner: Arc<Mutex<VecDeque<(ChatId, MessageId, IncomingFile)>>>,
-}
-
-impl IncomingFileCache {
-    pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(VecDeque::new())),
-        }
-    }
-
-    pub async fn insert(&self, chat_id: ChatId, msg_id: MessageId, file: IncomingFile) {
-        let mut q = self.inner.lock().await;
-        q.push_back((chat_id, msg_id, file));
-        while q.len() > INCOMING_FILE_CACHE_CAP {
-            q.pop_front();
-        }
-    }
-
-    pub async fn get(&self, chat_id: ChatId, msg_id: MessageId) -> Option<IncomingFile> {
-        self.inner
-            .lock()
-            .await
-            .iter()
-            .rev()
-            .find(|(c, m, _)| *c == chat_id && *m == msg_id)
-            .map(|(_, _, f)| f.clone())
     }
 }
 
@@ -492,9 +391,8 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                 .send_message(
                     msg.chat.id,
                     "👋 我是 ying!直接发文本或图片就行。\n\
-                     我可以用 `bash` 跑命令,也能看你发的图片,\n\
-                     还能看电脑上的图片(vision)、把文件直接发给你(send_file)。\n\
-                     你发的文档/视频/音频,说一声保存我就原样存下来(save_incoming)。\n\
+                     我可以用 `bash` 跑命令、`read` 读文件,\n\
+                     也能看你发的图片、看电脑上的图片(vision)。\n\
                      每次调用工具前都会发按钮请你明确同意。\n\
                      发送 /new 可以开启新会话(清空对话历史)。",
                 )
@@ -510,11 +408,6 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                 .await?;
             return Ok(());
         }
-    }
-
-    // 用户发来的文件先记下元数据,save_incoming 工具按消息 ID 查这里下载
-    if let Some(file) = extract_incoming_file(&msg) {
-        state.incoming_files.insert(msg.chat.id, msg.id, file).await;
     }
 
     // 构建发给模型的用户消息:纯文本,或图片(可带说明文字)

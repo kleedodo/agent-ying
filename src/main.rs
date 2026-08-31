@@ -15,14 +15,12 @@ use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatId, UpdateKind, UserId};
 use tokio::sync::Mutex;
 
-use std::path::PathBuf;
-
 use approval::ApprovalManager;
 use config::Config;
-use handlers::{IncomingFileCache, on_callback, on_message, on_unmatched};
+use handlers::{on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
 use skills::Skills;
-use tools::{Bash, ReadSkill, SaveIncoming, SendFile, ToolCtx, Vision};
+use tools::{Bash, Read, ToolCtx, Vision};
 
 // 用 mimalloc 替换系统默认分配器(减少内存碎片,降低常驻内存)
 #[global_allocator]
@@ -48,15 +46,12 @@ struct AppState {
     system_prompt: String,
     bash_timeout: Duration,
     approval_timeout: Duration,
-    /// 用户发来的文件元数据缓存(save_incoming 按消息 ID 查 file_id)
-    incoming_files: IncomingFileCache,
     allowed_user_ids: Vec<UserId>,
     temperature: f64,
     max_turns: usize,
     max_tokens: u64,
     /// 流式回复编辑间隔上限;实际每次编辑前随机等待 200ms~该值(小于 200ms 按 200ms)
     stream_edit_interval: Duration,
-    skills_dir: PathBuf,
 }
 
 impl AppState {
@@ -74,7 +69,6 @@ impl AppState {
             approvals: self.approvals.clone(),
             bash_timeout: self.bash_timeout,
             approval_timeout: self.approval_timeout,
-            incoming_files: self.incoming_files.clone(),
         };
         let mut builder = self
             .client
@@ -82,9 +76,7 @@ impl AppState {
             .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
-            .tool(SendFile(ctx.clone()))
-            .tool(SaveIncoming(ctx.clone()))
-            .tool(ReadSkill(self.skills_dir.clone()));
+            .tool(Read);
         // vision_model 留空(或省略)则不启用 vision agent
         if let Some(vision_client) = &self.vision_client {
             builder = builder.tool(Vision {
@@ -231,13 +223,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         system_prompt,
         bash_timeout,
         approval_timeout,
-        incoming_files: IncomingFileCache::new(),
         allowed_user_ids: config.allowed_user_ids,
         temperature: config.temperature,
         max_turns: config.max_turns,
         max_tokens: config.max_tokens,
         stream_edit_interval: Duration::from_millis(config.stream_edit_interval_ms),
-        skills_dir: Config::skills_dir(),
     };
 
     let handler = build_handler();

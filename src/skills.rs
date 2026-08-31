@@ -1,7 +1,7 @@
 //! 技能(skills):扫描 `~/.agent-ying/skills/<name>/SKILL.md`。
 //!
 //! 渐进式披露:启动时只把每个 skill 的 name + description 拼进系统提示,
-//! 模型判断任务匹配某个 skill 时,再用 read_skill 工具读取完整 SKILL.md。
+//! 模型判断任务匹配某个 skill 时,再用 read 工具读取完整 SKILL.md。
 
 use std::fs;
 use std::path::PathBuf;
@@ -56,7 +56,7 @@ impl Skills {
         }
         let mut out = String::from("\n\n## 技能\n\n以下技能为特定任务提供专门指令：\n");
         out.push_str("- 如果用户只是简单询问有哪些技能，不用读取具体的内容，直接回复即可。\n");
-        out.push_str("- 当任务匹配某个技能的描述时，用 read_skill 工具读取该技能的文件\n");
+        out.push_str("- 当任务匹配某个技能的描述时，用 read 工具读取该技能的文件\n");
         out.push_str(
             "- 当技能文件引用相对路径时，以技能目录(SKILL.md 的父目录 / 路径的 dirname)为基准解析，并在工具命令中使用该绝对路径。\n",
         );
