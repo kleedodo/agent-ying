@@ -1,5 +1,7 @@
 mod approval;
 mod config;
+mod edits;
+mod file_tools;
 mod handlers;
 mod skills;
 mod tools;
@@ -17,6 +19,7 @@ use tokio::sync::Mutex;
 
 use approval::ApprovalManager;
 use config::Config;
+use file_tools::{Edit, Write};
 use handlers::{on_callback, on_message, on_unmatched};
 use mimalloc::MiMalloc;
 use skills::Skills;
@@ -76,7 +79,9 @@ impl AppState {
             .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
-            .tool(Read);
+            .tool(Read)
+            .tool(Write(ctx.clone()))
+            .tool(Edit(ctx.clone()));
         // vision_model 留空(或省略)则不启用 vision agent
         if let Some(vision_client) = &self.vision_client {
             builder = builder.tool(Vision {
