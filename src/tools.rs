@@ -39,8 +39,8 @@ const MAX_SPILL_BYTES: usize = 256 * 1024 * 1024;
 
 /// 所有工具结果都全文落盘到会话的 `toolout/` 目录(见 ToolCtx::toolout_dir):
 /// 超过 [crate::journal::COMPRESS_MIN_BYTES] 的 gzip 压缩为 `<uuid>.txt.gz`,更小的保留纯文本 `<uuid>.txt`。
-/// 返回给模型的文本始终注明完整结果存在哪里:未超长时原样返回 + 保存路径;
-/// 超长时返回头 + 尾摘要和完整文件路径,模型可以用 bash 工具自行查看被省略的部分。
+/// 未超长时原样返回(全文仍落盘备查);超长时返回头 + 尾摘要和完整文件路径,
+/// 并注明可用 bash 工具自行查看被省略的部分。
 pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> {
     let id = Uuid::new_v4().simple().to_string();
 
@@ -67,6 +67,12 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
         .await
         .map_err(|e| ToolErr(format!("写入完整输出 {} 失败：{e}", path.display())))?;
 
+    let total = s.chars().count();
+    if total <= MAX_OUTPUT_CHARS {
+        // 未截断:原样返回,不给保存路径提示,省 token
+        return Ok(s.to_string());
+    }
+
     let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
     // 完整路径只在保存说明里出现一次;命令只给工具名不重复拼路径,省 token
     let cmd_hint = if is_gz {
@@ -74,14 +80,6 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
     } else {
         "可用 cat 查看、grep 搜索、sed/tail 截取该文件"
     };
-
-    let total = s.chars().count();
-    if total <= MAX_OUTPUT_CHARS {
-        return Ok(format!(
-            "{s}\n\n（完整结果已保存到 {}。{capped_note}{cmd_hint}。）",
-            path.display()
-        ));
-    }
 
     let head: String = s.chars().take(SPILL_HEAD_CHARS).collect();
     let tail: String = s.chars().skip(total - SPILL_TAIL_CHARS).collect();
