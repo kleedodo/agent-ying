@@ -1,5 +1,5 @@
-//! 编辑核心算法：
-//! 换行符规范化、BOM 剥离、模糊匹配、多处替换应用、展示向 diff 生成。
+//！ 编辑核心算法：
+//！ 换行符规范化、BOM 剥离、模糊匹配、多处替换应用、展示向 diff 生成。
 
 use similar::{DiffTag, TextDiff};
 use unicode_normalization::UnicodeNormalization;
@@ -11,7 +11,7 @@ pub struct Edit {
     pub new_text: String,
 }
 
-/// 探测文件换行风格:首个 CRLF 出现在首个独立 LF 之前则为 "\r\n",否则 "\n"
+/// 探测文件换行风格：首个 CRLF 出现在首个独立 LF 之前则为 "\r\n"，否则 "\n"
 pub fn detect_line_ending(content: &str) -> &'static str {
     let lf = content.find('\n');
     let crlf = content.find("\r\n");
@@ -37,7 +37,7 @@ pub fn restore_line_endings(s: &str, ending: &str) -> String {
     }
 }
 
-/// 剥离 BOM,返回 (bom, 正文)。模型不会在 oldText 里带不可见 BOM,匹配前先剥掉
+/// 剥离 BOM，返回 （bom， 正文）。模型不会在 oldText 里带不可见 BOM，匹配前先剥掉
 pub fn split_bom(s: &str) -> (&str, &str) {
     match s.strip_prefix('\u{feff}') {
         Some(rest) => ("\u{feff}", rest),
@@ -45,7 +45,7 @@ pub fn split_bom(s: &str) -> (&str, &str) {
     }
 }
 
-/// 模糊匹配用的归一化:
+/// 模糊匹配用的归一化：
 /// NFKC + 每行去尾部空白 + 智能引号/破折号/特殊空格归一为 ASCII
 fn fuzzy_char(c: char) -> char {
     match c {
@@ -53,10 +53,10 @@ fn fuzzy_char(c: char) -> char {
         '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
         // 智能双引号 → "
         '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
-        // 各种破折号/连字符(U+2010~U+2015、U+2212 减号)→ -
+        // 各种破折号/连字符（U+2010~U+2015、U+2212 减号）→ -
         '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
         | '\u{2212}' => '-',
-        // 特殊空格(NBSP、各类 Unicode 空格、窄 NBSP、中数学空格、全角空格)→ 普通空格
+        // 特殊空格（NBSP、各类 Unicode 空格、窄 NBSP、中数学空格、全角空格）→ 普通空格
         '\u{00A0}' | '\u{202F}' | '\u{205F}' | '\u{3000}' => ' ',
         c if ('\u{2002}'..='\u{200A}').contains(&c) => ' ',
         c => c,
@@ -78,15 +78,15 @@ pub fn normalize_for_fuzzy_match(text: &str) -> String {
 }
 
 pub struct FuzzyMatch {
-    /// 匹配起点(字节偏移,位于 contentForReplacement 空间)
+    /// 匹配起点（字节偏移，位于 contentForReplacement 空间）
     pub index: usize,
-    /// 匹配长度(字节,同空间)
+    /// 匹配长度（字节，同空间）
     pub match_length: usize,
-    /// 是否走了模糊匹配(false = 精确命中)
+    /// 是否走了模糊匹配（false = 精确命中）
     pub used_fuzzy: bool,
 }
 
-/// 先精确匹配,再在归一化空间模糊匹配
+/// 先精确匹配，再在归一化空间模糊匹配
 pub fn fuzzy_find_text(content: &str, old_text: &str) -> Option<FuzzyMatch> {
     if let Some(i) = content.find(old_text) {
         return Some(FuzzyMatch {
@@ -111,7 +111,7 @@ struct LineSpan {
     end: usize,
 }
 
-/// 按行(保留行尾换行符)计算每行的字节区间
+/// 按行（保留行尾换行符）计算每行的字节区间
 fn line_spans(content: &str) -> Vec<LineSpan> {
     let mut spans = Vec::new();
     let mut offset = 0usize;
@@ -152,7 +152,7 @@ fn replacement_line_range(
     Ok((start_line, end_line + 1))
 }
 
-/// 按起点升序、从后往前应用替换,保证偏移稳定
+/// 按起点升序、从后往前应用替换，保证偏移稳定
 fn apply_replacements(content: &str, repls: &[TextReplacement], offset: usize) -> String {
     let mut result = content.to_string();
     for r in repls.iter().rev() {
@@ -162,9 +162,9 @@ fn apply_replacements(content: &str, repls: &[TextReplacement], offset: usize) -
     result
 }
 
-/// 归一化空间匹配、原文空间落盘:把每个替换扩展到它实际触及的行,
-/// 触及的行用归一化基底重写,其余行原样从原文拷回,
-/// 未改动行块保留原始字节(如行尾空白、CRLF 前的原貌)。
+/// 归一化空间匹配、原文空间落盘：把每个替换扩展到它实际触及的行，
+/// 触及的行用归一化基底重写，其余行原样从原文拷回，
+/// 未改动行块保留原始字节（如行尾空白、CRLF 前的原貌）。
 fn apply_replacements_preserving_unchanged_lines(
     original: &str,
     base: &str,
@@ -179,7 +179,7 @@ fn apply_replacements_preserving_unchanged_lines(
         );
     }
 
-    // 按起点排序,重叠/相邻的行范围合并为一组
+    // 按起点排序，重叠/相邻的行范围合并为一组
     let sorted: Vec<&TextReplacement> = {
         let mut v: Vec<&TextReplacement> = repls.iter().collect();
         v.sort_by_key(|r| r.start);
@@ -217,7 +217,7 @@ fn apply_replacements_preserving_unchanged_lines(
 
 #[derive(Debug)]
 pub struct AppliedEdits {
-    /// 改动前的 LF 规范化内容(供 diff 对比)
+    /// 改动前的 LF 规范化内容（供 diff 对比）
     pub base: String,
     /// 改动后的 LF 规范化内容
     pub new: String,
@@ -267,8 +267,8 @@ fn no_change_err(path: &str, total: usize) -> String {
 
 /// 在 LF 规范化内容上应用一组精确文本替换。
 ///
-/// 所有编辑都对着同一份原始内容匹配(不是增量匹配),替换按起点排序后倒序应用;
-/// 任一编辑走了模糊匹配时,在归一化空间做替换再把改动行回贴到原文,
+/// 所有编辑都对着同一份原始内容匹配（不是增量匹配），替换按起点排序后倒序应用；
+/// 任一编辑走了模糊匹配时，在归一化空间做替换再把改动行回贴到原文，
 /// 未改动行块保留原始字节。
 pub fn apply_edits(
     normalized_content: &str,
@@ -287,7 +287,7 @@ pub fn apply_edits(
         }
     }
 
-    // 有任一编辑需要模糊匹配,则整体切换到归一化空间做替换
+    // 有任一编辑需要模糊匹配，则整体切换到归一化空间做替换
     let used_fuzzy = norm_edits
         .iter()
         .any(|(old, _)| fuzzy_find_text(normalized_content, old).is_some_and(|m| m.used_fuzzy));
@@ -350,7 +350,7 @@ pub fn apply_edits(
     })
 }
 
-/// 替换基底要么是原文,要么是归一化副本
+/// 替换基底要么是原文，要么是归一化副本
 enum CowStr<'a> {
     Borrowed(&'a str),
     Owned(String),
@@ -367,19 +367,19 @@ impl CowStr<'_> {
 
 // ---------------------------------------------------------------- diff 生成
 
-/// 展示向 diff:带行号、改动前后各保留 context_lines 行上下文、
+/// 展示向 diff：带行号、改动前后各保留 context_lines 行上下文、
 /// 过长上下文用 `...` 省略。
-/// 返回 (diff 文本, 新文件中第一个被改动行的行号)。
+/// 返回 （diff 文本， 新文件中第一个被改动行的行号）。
 pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
     const CONTEXT: usize = 4;
 
     let diff = TextDiff::from_lines(old, new);
-    // diff 的 op range 以行为单位,预先按行拆开
+    // diff 的 op range 以行为单位，预先按行拆开
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
     let width = old_lines.len().max(new_lines.len()).to_string().len();
 
-    // 把 opcodes 展平成 added/removed/context 片段(Replace 拆成 removed+added,对齐 diffLines)
+    // 把 opcodes 展平成 added/removed/context 片段（Replace 拆成 removed+added，对齐 diffLines）
     #[derive(PartialEq)]
     enum Kind {
         Added,
@@ -478,7 +478,7 @@ pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
                         new_num += 1;
                     }
                 } else {
-                    // 远离任何改动的上下文:整段跳过
+                    // 远离任何改动的上下文：整段跳过
                     old_num += raw.len();
                     new_num += raw.len();
                 }
@@ -543,7 +543,7 @@ mod tests {
     fn fuzzy_match_strips_trailing_ws_and_smart_quotes() {
         let content = "let a = “b”   \nnext line\n";
         let r = apply_edits(content, &[edit("let a = \"b\"", "let a = 'B'")], "f.txt").unwrap();
-        // 改动行按归一化空间重写,其余行原样保留
+        // 改动行按归一化空间重写，其余行原样保留
         assert_eq!(r.new, "let a = 'B'\nnext line\n");
     }
 
@@ -564,7 +564,7 @@ mod tests {
 
     #[test]
     fn crlf_bom_roundtrip() {
-        // edit 工具完整文件流程:BOM + CRLF 文件改动后应保留 BOM 和 CRLF
+        // edit 工具完整文件流程：BOM + CRLF 文件改动后应保留 BOM 和 CRLF
         let raw = "\u{feff}a\r\nb\r\nc\r\n";
         let (bom, content) = split_bom(raw);
         let ending = detect_line_ending(content);

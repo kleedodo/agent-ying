@@ -1,6 +1,5 @@
-//! rig 工具:bash、read、vision。
-//! 除 read(只读)和用户发图的 vision(发图即同意)外,
-//! 每个工具执行前都会先通过 Telegram 内联按钮请用户明确同意。
+//! rig 工具：bash、read、vision。
+//！ 每个工具执行前都会先通过 Telegram 内联按钮请用户明确同意。
 
 use std::path::Path;
 
@@ -22,10 +21,10 @@ use uuid::Uuid;
 use crate::approval::{ApprovalManager, request_approval};
 use crate::handlers::{compress_image, is_temp_image_path};
 
-/// 工具输出超过该字符数时返回头尾摘要(全文始终落盘)
-/// 输出会进多轮历史、每轮重复送给模型,故阈值偏保守:够多数命令用,超出就只给摘要让模型按需取
+/// 工具输出超过该字符数时返回头尾摘要（全文始终落盘）
+/// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给摘要让模型按需取
 const MAX_OUTPUT_CHARS: usize = 8000;
-/// 落盘后返回摘要中保留的头部字符数(与尾部之和须小于 MAX_OUTPUT_CHARS)
+/// 落盘后返回摘要中保留的头部字符数（与尾部之和须小于 MAX_OUTPUT_CHARS）
 const SPILL_HEAD_CHARS: usize = 3000;
 /// 落盘后返回摘要中保留的尾部字符数
 const SPILL_TAIL_CHARS: usize = 2000;
@@ -34,27 +33,27 @@ const SPILL_TAIL_CHARS: usize = 2000;
 #[error("{0}")]
 pub struct ToolErr(pub String);
 
-/// 单个落盘文件的硬上限:完整输出超过该字节数时只保存前 256MB(按字符边界截断)
+/// 单个落盘文件的硬上限：完整输出超过该字节数时只保存前 256MB（按字符边界截断）
 const MAX_SPILL_BYTES: usize = 256 * 1024 * 1024;
 
-/// 所有工具结果都全文落盘到会话的 `toolout/` 目录(见 ToolCtx::toolout_dir):
-/// 超过 [crate::journal::COMPRESS_MIN_BYTES] 的 gzip 压缩为 `<uuid>.txt.gz`,更小的保留纯文本 `<uuid>.txt`。
-/// 未超长时原样返回(全文仍落盘备查);超长时返回头 + 尾摘要和完整文件路径,
+/// 所有工具结果都全文落盘到会话的 `toolout/` 目录（见 ToolCtx::toolout_dir）：
+/// 超过 [crate::journal::COMPRESS_MIN_BYTES] 的 gzip 压缩为 `<uuid>.txt.gz`，更小的保留纯文本 `<uuid>.txt`。
+/// 未超长时原样返回（全文仍落盘备查）；超长时返回头 + 尾摘要和完整文件路径，
 /// 并注明可用 bash 工具自行查看被省略的部分。
 pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> {
     let id = Uuid::new_v4().simple().to_string();
 
-    // 单文件硬上限:只保存前 256MB(不跨字符边界)
+    // 单文件硬上限：只保存前 256MB（不跨字符边界）
     let end = s.floor_char_boundary(MAX_SPILL_BYTES.min(s.len()));
     let spill = &s[..end];
     let capped_note = if end < s.len() {
-        format!("完整输出共 {} 字节,仅保存了前 256MB。", s.len())
+        format!("完整输出共 {} 字节，仅保存了前 256MB。", s.len())
     } else {
         String::new()
     };
     let data = spill.as_bytes().to_vec();
 
-    // 超过 50KB 才 gzip 压缩,小文件保留纯文本直接可读
+    // 超过 50KB 才 gzip 压缩，小文件保留纯文本直接可读
     let (path, payload) = if data.len() > crate::journal::COMPRESS_MIN_BYTES {
         let compressed = tokio::task::spawn_blocking(move || crate::journal::gzip_bytes(&data))
             .await
@@ -69,12 +68,12 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
 
     let total = s.chars().count();
     if total <= MAX_OUTPUT_CHARS {
-        // 未截断:原样返回,不给保存路径提示,省 token
+        // 未截断：原样返回，不给保存路径提示，省 token
         return Ok(s.to_string());
     }
 
     let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
-    // 完整路径只在保存说明里出现一次;命令只给工具名不重复拼路径,省 token
+    // 完整路径只在保存说明里出现一次；命令只给工具名不重复拼路径，省 token
     let cmd_hint = if is_gz {
         "可用 zgrep 查看/搜索该文件"
     } else {
@@ -90,7 +89,7 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
     ))
 }
 
-/// 两个工具共用的字段:目标聊天 + 审批管理器 + 用户发来文件的缓存。
+/// 两个工具共用的字段：目标聊天 + 审批管理器 + 用户发来文件的缓存。
 #[derive(Clone)]
 pub struct ToolCtx {
     pub bot: Bot,
@@ -98,7 +97,7 @@ pub struct ToolCtx {
     pub approvals: ApprovalManager,
     pub bash_timeout: std::time::Duration,
     pub approval_timeout: std::time::Duration,
-    /// 当前会话的 toolout/ 目录,所有工具结果的全文都落盘到这里
+    /// 当前会话的 toolout/ 目录，所有工具结果的全文都落盘到这里
     pub toolout_dir: std::path::PathBuf,
 }
 
@@ -127,7 +126,7 @@ impl Tool for Bash {
     type Output = String;
 
     fn description(&self) -> String {
-        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr。命令中涉及文件/目录时一律使用绝对路径（不接受相对路径）".into()
+        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -216,20 +215,20 @@ impl Tool for Bash {
 
 /// read 默认最多读取的行数
 const DEFAULT_READ_LIMIT: usize = 2000;
-/// read 输出字节上限(与行数上限取先到者)
+/// read 输出字节上限（与行数上限取先到者）
 const MAX_READ_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadArgs {
-    /// 要读取的文件路径(必须是绝对路径)
+    /// 要读取的文件路径（必须是绝对路径）
     pub path: String,
-    /// 从第几行开始读(1 起,默认 1)
+    /// 从第几行开始读（1 起，默认 1）
     pub offset: Option<usize>,
     /// 最多读多少行（默认 2000，输出达到 50KB 也会截断）
     pub limit: Option<usize>,
 }
 
-/// 只读一个文本文件(skills 文件或其他任意文件),只读无副作用,免审批。
+/// 只读一个文本文件（skills 文件或其他任意文件），只读无副作用，但仍需审批。
 #[derive(Clone)]
 pub struct Read(pub ToolCtx);
 
@@ -248,9 +247,8 @@ impl Tool for Read {
 
     fn description(&self) -> String {
         format!(
-            "读取一个文本文件（如 SKILL.md 或其他任意文件）：路径必须是绝对路径（不接受相对路径）。\
-             返回原始内容（不带行号前缀）；默认最多读 {} 行或 50KB（先到者为准），\
-             截断时会附提示，可用 offset（起始行号，1 起）续读，也可用 limit 指定行数",
+            "读取一个文本文件（如 SKILL.md 或其他任意文件），返回原始内容（不带行号前缀）；\
+             默认最多读 {} 行或 50KB（先到者为准），截断时会附提示",
             DEFAULT_READ_LIMIT
         )
     }
@@ -292,6 +290,27 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
+        // 先确认文件存在再请审批，避免审批通过后才发现读不到
+        let approved = request_approval(
+            &ctx.bot,
+            ctx.chat_id,
+            &ctx.approvals,
+            ctx.approval_timeout,
+            "read",
+            &format!("读取文件：`{}`", args.path),
+        )
+        .await
+        .map_err(ToolErr)?;
+
+        if !approved {
+            tracing::info!("read 被用户拒绝：{}", args.path);
+            return Ok(format!(
+                "用户拒绝了读取文件 `{}`，立即停止尝试并追问用户原因。",
+                args.path
+            ));
+        }
+        tracing::info!("read 开始读取：{}", args.path);
+
         // 先检查文件可读性
         let mut file = tokio::fs::File::open(&target)
             .await
@@ -301,7 +320,7 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        // 行计数:split('\n')(末尾换行会多出一个空行,不做特殊处理)
+        // 行计数：split('\n')（末尾换行会多出一个空行，不做特殊处理）
         let all_lines: Vec<&str> = content.split('\n').collect();
         let total = all_lines.len();
         let start = args.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
@@ -314,7 +333,7 @@ impl Tool for Read {
             )));
         }
 
-        // 用户 limit 先截取,之后仍统一受 2000 行/50KB 上限约束
+        // 用户 limit 先截取，之后仍统一受 2000 行/50KB 上限约束
         let (selected, user_limited): (String, Option<usize>) = match args.limit {
             Some(l) if l > 0 => {
                 let end = (start + l).min(total);
@@ -323,15 +342,15 @@ impl Tool for Read {
             _ => (all_lines[start..].join("\n"), None),
         };
 
-        // 行数统计:末尾换行不产生额外行
+        // 行数统计：末尾换行不产生额外行
         let mut sel_lines: Vec<&str> = selected.split('\n').collect();
         if selected.ends_with('\n') {
             sel_lines.pop();
         }
 
-        // 未超限:原样返回(不带行号前缀)
+        // 未超限：原样返回（不带行号前缀）
         if sel_lines.len() <= DEFAULT_READ_LIMIT && selected.len() <= MAX_READ_BYTES {
-            // 未截断但用户 limit 提前停、文件还有剩余:提示续读
+            // 未截断但用户 limit 提前停、文件还有剩余：提示续读
             if let Some(limited) = user_limited {
                 let remaining = total - (start + limited);
                 if remaining > 0 {
@@ -348,7 +367,7 @@ impl Tool for Read {
             return record_tool_result(&ctx.toolout_dir, &selected).await;
         }
 
-        // 首行单行即超 50KB:正常返回提示让 agent 改用 bash(不算工具错误)
+        // 首行单行即超 50KB：正常返回提示让 agent 改用 bash（不算工具错误）
         if sel_lines.first().is_some_and(|l| l.len() > MAX_READ_BYTES) {
             return record_tool_result(
                 &ctx.toolout_dir,
@@ -362,7 +381,7 @@ impl Tool for Read {
             .await;
         }
 
-        // 从头收集完整行,直到达到行数或字节上限(永不返回半行)
+        // 从头收集完整行，直到达到行数或字节上限（永不返回半行）
         let mut out_lines: Vec<&str> = Vec::new();
         let mut bytes = 0usize;
         for (i, line) in sel_lines.iter().enumerate().take(DEFAULT_READ_LIMIT) {
@@ -391,7 +410,7 @@ impl Tool for Read {
     }
 }
 
-/// 把字节数格式化为人类可读的大小(如 `512B`、`1.2MB`)。
+/// 把字节数格式化为人类可读的大小（如 `512B`、`1.2MB`）。
 pub fn human_size(bytes: u64) -> String {
     const KB: f64 = 1024.0;
     const MB: f64 = 1024.0 * 1024.0;
@@ -408,18 +427,18 @@ pub fn human_size(bytes: u64) -> String {
 
 #[derive(Debug, Deserialize)]
 pub struct VisionArgs {
-    /// 要查看的图片路径(必须是绝对路径)
+    /// 要查看的图片路径（必须是绝对路径）
     pub path: String,
 }
 
-/// 看图工具:用多模态模型看图片,调用前先请用户审批。
+/// 看图工具：用多模态模型看图片，调用前先请用户审批。
 #[derive(Clone)]
 pub struct Vision {
     pub client: openai::CompletionsClient,
     pub model: String,
-    /// 解析后的 vision 系统提示词(可被 VISION_SYSTEM.md 覆盖)
+    /// 解析后的 vision 系统提示词（可被 VISION_SYSTEM.md 覆盖）
     pub system_prompt: String,
-    /// 审批/发按钮所需的上下文(bot + chat + 审批管理器)
+    /// 审批/发按钮所需的上下文（bot + chat + 审批管理器）
     pub ctx: ToolCtx,
 }
 
@@ -431,7 +450,7 @@ impl std::fmt::Debug for Vision {
     }
 }
 
-/// 根据文件扩展名推断图片 media type,无法识别则报错。
+/// 根据文件扩展名推断图片 media type，无法识别则报错。
 fn media_type_from_path(path: &str) -> Result<ImageMediaType, ToolErr> {
     let ext = Path::new(path)
         .extension()
@@ -461,7 +480,7 @@ impl Tool for Vision {
     type Output = String;
 
     fn description(&self) -> String {
-        "查看本地电脑上的图片文件（按绝对路径指定，不接受相对路径）：是文字图片则按原结构提取文字，是风景/照片等非文字内容则详细描述图片内容。注意：只用于查看本地电脑上的图片；用户直接发来的图片通常已经能看到，除非消息中明确说明图片已保存到某个本地路径，否则不要调用本工具".into()
+        "查看本地电脑上的图片：是文字图片则按原结构提取文字，是风景/照片等非文字内容则详细描述图片内容。注意：用户直接发来的图片通常已经能看到，除非消息中明确说明图片已保存到某个本地路径，否则不要调用本工具".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -483,8 +502,8 @@ impl Tool for Vision {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.ctx;
-        // 临时目录里的图片是「用户刚发来的图」(主模型非多模态时被转发过来):
-        // 用户发图即视为同意看图,免审批;调用结束后(无论成败)自动删除
+        // 临时目录里的图片是「用户刚发来的图」（主模型非多模态时被转发过来）:
+        // 调用结束后（无论成败）自动删除
         let is_temp = is_temp_image_path(&args.path);
 
         if !Path::new(&args.path).is_absolute() {
@@ -494,7 +513,7 @@ impl Tool for Vision {
             )));
         }
 
-        // 先检查文件存在性和大小,避免审批通过后才发现读不到
+        // 先检查文件存在性和大小，避免审批通过后才发现读不到
         let metadata = tokio::fs::metadata(&args.path)
             .await
             .map_err(|e| ToolErr(format!("读取图片 `{}` 失败：{e}", args.path)))?;
@@ -502,32 +521,32 @@ impl Tool for Vision {
             return Err(ToolErr(format!("`{}` 不是普通文件", args.path)));
         }
 
-        if is_temp {
-            tracing::info!("vision 查看用户发来的图片（免审批）：{}", args.path);
-        } else {
-            let approved = request_approval(
-                &ctx.bot,
-                ctx.chat_id,
-                &ctx.approvals,
-                ctx.approval_timeout,
-                "vision",
-                &format!("看图：`{}`（{}）", args.path, human_size(metadata.len())),
-            )
-            .await
-            .map_err(ToolErr)?;
+        let approved = request_approval(
+            &ctx.bot,
+            ctx.chat_id,
+            &ctx.approvals,
+            ctx.approval_timeout,
+            "vision",
+            &format!("看图：`{}`（{}）", args.path, human_size(metadata.len())),
+        )
+        .await
+        .map_err(ToolErr)?;
 
-            if !approved {
-                tracing::info!("vision 被用户拒绝：{}", args.path);
-                return Ok(format!(
-                    "用户拒绝了看图 `{}`，停止尝试并追问用户。",
-                    args.path
-                ));
+        if !approved {
+            tracing::info!("vision 被用户拒绝：{}", args.path);
+            // 临时图片用户已看过，被拒绝时同样删除
+            if is_temp {
+                remove_temp_image(&args.path).await;
             }
-            tracing::info!("vision 开始看图：{}", args.path);
+            return Ok(format!(
+                "用户拒绝了看图 `{}`，停止尝试并追问用户。",
+                args.path
+            ));
         }
+        tracing::info!("vision 开始看图：{}", args.path);
 
         // 1–6. 读文件 → 压缩 → 调 vision 模型 → 截断输出。
-        // 包在内部块里,保证任何一步失败(读文件、格式识别、网络等)都会走到下面的临时文件清理。
+        // 包在内部块里，保证任何一步失败（读文件、格式识别、网络等）都会走到下面的临时文件清理。
         let result: Result<String, ToolErr> = async {
             // 1. 读文件
             let bytes = tokio::fs::read(&args.path)
@@ -557,7 +576,7 @@ impl Tool for Vision {
             ];
             let user_msg = RigMessage::User { content };
 
-            // 5. 构建 vision agent 并调用(单轮,无需历史)
+            // 5. 构建 vision agent 并调用（单轮，无需历史）
             let agent = self
                 .client
                 .agent(self.model.clone())
@@ -576,18 +595,23 @@ impl Tool for Vision {
                 reply.chars().count()
             );
 
-            // 6. 全文落盘并注明保存位置,超长则返回头尾摘要
+            // 6. 全文落盘并注明保存位置，超长则返回头尾摘要
             record_tool_result(&ctx.toolout_dir, &reply).await
         }
         .await;
 
-        // 7. 删除临时图片(用户发来的转发图,无论调用成败都不再需要)
+        // 7. 删除临时图片（用户发来的转发图，无论调用成败都不再需要）
         if is_temp {
-            match tokio::fs::remove_file(&args.path).await {
-                Ok(()) => tracing::info!("已删除临时图片：{}", args.path),
-                Err(e) => tracing::warn!("删除临时图片 `{}` 失败：{e}", args.path),
-            }
+            remove_temp_image(&args.path).await;
         }
         result
+    }
+}
+
+/// 删除用户发来的转发图（临时目录内的图片），失败只告警不报错
+async fn remove_temp_image(path: &str) {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => tracing::info!("已删除临时图片：{path}"),
+        Err(e) => tracing::warn!("删除临时图片 `{path}` 失败：{e}"),
     }
 }

@@ -1,4 +1,4 @@
-//! 配置:启动时确保 `~/.agent-ying/` 存在,没有 `config.json` 就写出默认模板,然后加载。
+//！ 配置：启动时确保 `~/.agent-ying/` 存在，没有 `config.json` 就写出默认模板，然后加载。
 
 use std::fs;
 use std::path::PathBuf;
@@ -45,59 +45,59 @@ pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Tele
 - 在处理文件或者数据时，使用合理的工具进行过滤，比如jq、grep、sed或者生成一个python脚本过滤等
 - 回复尽量简短，代码／命令输出超过必要长度时做摘要。"#;
 
-/// vision agent(看图工具)的默认系统提示词。
+/// vision agent（看图工具）的默认系统提示词。
 /// 可被 `~/.agent-ying/VISION_SYSTEM.md` 覆盖。
-pub const DEFAULT_VISION_PROMPT: &str = r#"你是一个专门看图的 vision agent,负责把图片内容转成文字交给主 agent。根据图片内容分两种情况处理:
+pub const DEFAULT_VISION_PROMPT: &str = r#"你是一个专门看图的 vision agent，负责把图片内容转成文字交给主 agent。根据图片内容分两种情况处理：
 
-1. 如果图片主要是文字(文档、截图、代码、白板、手写笔记、表格等):
-   - 尽量按照原来的结构提取文字,保留标题层级、列表、代码块、表格、换行、缩进等结构
-   - 用 Markdown 格式输出:代码用 ``` 包裹,表格用 Markdown 表格,层级用 #/列表
-   - 忠实还原文字内容,不要总结、不要遗漏、不要改写
+1. 如果图片主要是文字（文档、截图、代码、白板、手写笔记、表格等）:
+   - 尽量按照原来的结构提取文字，保留标题层级、列表、代码块、表格、换行、缩进等结构
+   - 用 Markdown 格式输出：代码用 ``` 包裹，表格用 Markdown 表格，层级用 #/列表
+   - 忠实还原文字内容，不要总结、不要遗漏、不要改写
 
-2. 如果图片是风景、照片、插画、图表等非文字内容:
-   - 使用准确、具体的语言详细描述图片内容:主体及其动作/状态、环境与背景、颜色与光线、构图、值得注意的细节
-   - 只描述你确实看到的,不要过度解读或编造
+2. 如果图片是风景、照片、插画、图表等非文字内容：
+   - 使用准确、具体的语言详细描述图片内容：主体及其动作/状态、环境与背景、颜色与光线、构图、值得注意的细节
+   - 只描述你确实看到的，不要过度解读或编造
 
-3. 如果图片模糊、被截断或难以辨认,如实说明。
+3. 如果图片模糊、被截断或难以辨认，如实说明。
 
-直接输出提取的文字或描述本身,不要加“这张图片是……”之类的寒暄开场白。"#;
+直接输出提取的文字或描述本身，不要加“这张图片是……”之类的寒暄开场白。"#;
 
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 pub struct Config {
-    /// Telegram bot token,形如 `123456:ABC...`
+    /// Telegram bot token，形如 `123456:ABC...`
     pub telegram_bot_token: String,
     /// OpenAI API key
     pub openai_api_key: String,
-    /// OpenAI 兼容服务的 base URL,留空则用官方 https://api.openai.com/v1
+    /// OpenAI 兼容服务的 base URL，留空则用官方 https://api.openai.com/v1
     /// 例如 OpenRouter: https://openrouter.ai/api/v1
     #[serde(default)]
     pub openai_base_url: Option<String>,
     /// agent 名字
     #[serde(default = "default_name")]
     pub name: String,
-    /// 模型名,如 gpt-5-mini、gpt-5
+    /// 模型名，如 gpt-5-mini、gpt-5
     pub model: String,
-    /// 是否把用户发来的图片转发给 vision 工具查看(即主模型本身非多模态、不能直接看图)
-    /// true 且 vision 已启用时,图片存到临时文件,提示主 agent 用 vision 工具查看(免审批,调用后自动删除);
-    /// false(或 vision 未启用)时,图片原样内嵌发给主模型
+    /// 是否把用户发来的图片转发给 vision 工具查看（即主模型本身非多模态、不能直接看图）
+    /// true 且 vision 已启用时，图片存到临时文件，提示主 agent 用 vision 工具查看（调用后自动删除）;
+    /// false（或 vision 未启用）时，图片原样内嵌发给主模型
     #[serde(default = "default_forward_to_vision")]
     pub forward_to_vision: bool,
-    /// vision agent(看图工具)使用的模型,需支持多模态,如 gpt-5-mini、gpt-4o
-    /// 留空(或省略)则不启用 vision agent
+    /// vision agent（看图工具）使用的模型，需支持多模态，如 gpt-5-mini、gpt-4o
+    /// 留空（或省略）则不启用 vision agent
     #[serde(default)]
     pub vision_model: String,
-    /// vision agent 专用的 API key,留空则回退到 openai_api_key
+    /// vision agent 专用的 API key，留空则回退到 openai_api_key
     #[serde(default)]
     pub vision_api_key: Option<String>,
-    /// vision agent 专用的 OpenAI 兼容 base URL,留空则回退到 openai_base_url(再留空则用官方地址)
+    /// vision agent 专用的 OpenAI 兼容 base URL，留空则回退到 openai_base_url（再留空则用官方地址）
     #[serde(default)]
     pub vision_base_url: Option<String>,
-    /// bash 工具超时(秒)
+    /// bash 工具超时（秒）
     pub bash_timeout_secs: u64,
-    /// 审批等待超时(秒),超过则按拒绝处理
+    /// 审批等待超时（秒），超过则按拒绝处理
     #[serde(default = "default_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
-    /// 只响应这些 Telegram user id;留空则响应所有人
+    /// 只响应这些 Telegram user id；留空则响应所有人
     #[serde(default)]
     pub allowed_user_ids: Vec<UserId>,
     /// 采样温度
@@ -109,8 +109,8 @@ pub struct Config {
     /// 单次模型响应最大 token 数
     #[serde(default = "default_max_tokens")]
     pub max_tokens: u64,
-    /// 流式回复编辑间隔上限(毫秒):每次编辑前随机等待 200ms~该值
-    /// (配置小于 200ms 时按 200ms 执行),用于防触发 Telegram 限频
+    /// 流式回复编辑间隔上限（毫秒）：每次编辑前随机等待 200ms~该值
+    /// （配置小于 200ms 时按 200ms 执行），用于防触发 Telegram 限频
     #[serde(default = "default_stream_edit_interval_ms")]
     pub stream_edit_interval_ms: u64,
 }
@@ -186,12 +186,12 @@ impl Config {
         Self::dir().join("VISION_SYSTEM.md")
     }
 
-    /// skills 根目录(固定为 `~/.agent-ying/skills/`)
+    /// skills 根目录（固定为 `~/.agent-ying/skills/`）
     pub fn skills_dir() -> PathBuf {
         Self::dir().join("skills")
     }
 
-    /// journals 根目录(固定为 `~/.agent-ying/journals/`),按 YYYY-MM 分子目录记录会话
+    /// journals 根目录（固定为 `~/.agent-ying/journals/`），按 YYYY-MM 分子目录记录会话
     pub fn journals_dir() -> PathBuf {
         Self::dir().join("journals")
     }
@@ -200,7 +200,7 @@ impl Config {
         Self::dir().join("config.json")
     }
 
-    /// 创建目录、必要时写出默认配置,再加载。
+    /// 创建目录、必要时写出默认配置，再加载。
     pub fn load() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let dir = Self::dir();
         fs::create_dir_all(&dir)?;
@@ -209,7 +209,7 @@ impl Config {
         if !path.exists() {
             let template = Self::default();
             fs::write(&path, serde_json::to_string_pretty(&template)?)?;
-            tracing::info!("已写入默认配置: {}", path.display());
+            tracing::info!("已写入默认配置： {}", path.display());
         }
 
         let cfg: Config = serde_json::from_str(&fs::read_to_string(&path)?)?;
@@ -222,8 +222,8 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 解析最终系统提示,优先级从高到低:
-    /// 1. `~/.agent-ying/SYSTEM.md`(存在则用其内容)
+    /// 解析最终系统提示，优先级从高到低：
+    /// 1. `~/.agent-ying/SYSTEM.md`（存在则用其内容）
     /// 2. 代码内默认值
     pub fn resolve_system_prompt(&self) -> String {
         let md = Self::system_md_path();
@@ -240,8 +240,8 @@ impl Config {
         prompt
     }
 
-    /// 解析 vision agent 的系统提示,优先级从高到低:
-    /// 1. `~/.agent-ying/VISION_SYSTEM.md`(存在则用其内容)
+    /// 解析 vision agent 的系统提示，优先级从高到低：
+    /// 1. `~/.agent-ying/VISION_SYSTEM.md`（存在则用其内容）
     /// 2. 代码内默认值 DEFAULT_VISION_PROMPT
     pub fn resolve_vision_prompt() -> String {
         let md = Self::vision_system_md_path();
@@ -273,7 +273,7 @@ mod tests {
     #[test]
     fn resolve_system_prompt_falls_back_to_default_with_char_replaced() {
         if has_system_md() {
-            eprintln!("跳过: 存在 {}", Config::system_md_path().display());
+            eprintln!("跳过： 存在 {}", Config::system_md_path().display());
             return;
         }
         let cfg = Config {
@@ -289,7 +289,7 @@ mod tests {
     #[test]
     fn resolve_vision_prompt_falls_back_to_default() {
         if has_vision_system_md() {
-            eprintln!("跳过: 存在 {}", Config::vision_system_md_path().display());
+            eprintln!("跳过： 存在 {}", Config::vision_system_md_path().display());
             return;
         }
         assert_eq!(Config::resolve_vision_prompt(), DEFAULT_VISION_PROMPT);

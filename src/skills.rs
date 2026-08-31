@@ -1,7 +1,7 @@
-//! 技能(skills):扫描 `~/.agent-ying/skills/<name>/SKILL.md`。
+//！ 技能（skills）：扫描 `~/.agent-ying/skills/<name>/SKILL.md`。
 //!
-//! 渐进式披露:启动时只把每个 skill 的 name + description 拼进系统提示,
-//! 模型判断任务匹配某个 skill 时,再用 read 工具读取完整 SKILL.md。
+//！ 渐进式披露：启动时只把每个 skill 的 name + description 拼进系统提示，
+//！ 模型判断任务匹配某个 skill 时，再用 read 工具读取完整 SKILL.md。
 
 use std::fs;
 use std::path::PathBuf;
@@ -20,7 +20,7 @@ pub struct Skills {
 }
 
 impl Skills {
-    /// 扫描目录下每个子目录的 SKILL.md;目录不存在或为空都返回空列表。
+    /// 扫描目录下每个子目录的 SKILL.md；目录不存在或为空都返回空列表。
     pub fn load(dir: PathBuf) -> Self {
         let mut skills = Vec::new();
         if let Ok(entries) = fs::read_dir(&dir) {
@@ -49,7 +49,7 @@ impl Skills {
         Self { skills }
     }
 
-    /// 追加到系统提示末尾的 `<available_skills>` 文本块;没有 skill 时返回 None。
+    /// 追加到系统提示末尾的 `<available_skills>` 文本块；没有 skill 时返回 None。
     pub fn render_block(&self) -> Option<String> {
         if self.skills.is_empty() {
             return None;
@@ -58,7 +58,7 @@ impl Skills {
         out.push_str("- 如果用户只是简单询问有哪些技能，不用读取具体的内容，直接回复即可。\n");
         out.push_str("- 当任务匹配某个技能的描述时，用 read 工具读取该技能的文件\n");
         out.push_str(
-            "- 当技能文件引用相对路径时，以技能目录(SKILL.md 的父目录 / 路径的 dirname)为基准解析，并在工具命令中使用该绝对路径。\n",
+            "- 当技能文件引用相对路径时，以技能目录（SKILL.md 的父目录 / 路径的 dirname）为基准解析，并在工具命令中使用该绝对路径。\n",
         );
         out.push_str("- 技能文件内容里提到的所有环境变量，不允许读取和打印它们的值，只允许确认它们是否存在或者直接使用即可\n");
         out.push_str("\n<available_skills>\n");
@@ -73,8 +73,8 @@ impl Skills {
     }
 }
 
-/// 解析 SKILL.md 开头的 YAML frontmatter,只取 name / description 两个单行字段。
-/// 没有 frontmatter 或缺字段时,name 回退为目录名,description 留空。
+/// 解析 SKILL.md 开头的 YAML frontmatter，只取 name / description 两个单行字段。
+/// 没有 frontmatter 或缺字段时，name 回退为目录名，description 留空。
 fn parse_frontmatter(content: &str, fallback_name: &str) -> (String, String) {
     let mut lines = content.lines();
     let mut name = String::new();
