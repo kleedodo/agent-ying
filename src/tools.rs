@@ -103,7 +103,7 @@ impl Tool for Bash {
     type Output = String;
 
     fn description(&self) -> String {
-        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr".into()
+        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr。命令中涉及文件/目录时一律使用绝对路径（不接受相对路径）".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -112,7 +112,7 @@ impl Tool for Bash {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "要执行的 bash 命令"
+                    "description": "要执行的 bash 命令（涉及文件/目录时请使用绝对路径，不接受相对路径）"
                 }
             },
             "required": ["command"]
@@ -197,7 +197,7 @@ const MAX_READ_BYTES: usize = 50 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct ReadArgs {
-    /// 要读取的文件路径(绝对路径,或相对当前工作目录)
+    /// 要读取的文件路径(必须是绝对路径)
     pub path: String,
     /// 从第几行开始读(1 起,默认 1)
     pub offset: Option<usize>,
@@ -224,7 +224,7 @@ impl Tool for Read {
 
     fn description(&self) -> String {
         format!(
-            "读取一个文本文件（如 SKILL.md 或其他任意文件）：路径为绝对路径，或相对当前工作目录。\
+            "读取一个文本文件（如 SKILL.md 或其他任意文件）：路径必须是绝对路径（不接受相对路径）。\
              返回原始内容（不带行号前缀）；默认最多读 {} 行或 50KB（先到者为准），\
              截断时会附提示，可用 offset（起始行号，1 起）续读，也可用 limit 指定行数",
             DEFAULT_READ_LIMIT
@@ -237,7 +237,7 @@ impl Tool for Read {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "要读取的文件路径（绝对路径，或相对当前工作目录）"
+                    "description": "要读取的文件路径（必须是绝对路径，不接受相对路径）"
                 },
                 "offset": {
                     "type": "integer",
@@ -257,6 +257,12 @@ impl Tool for Read {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        if !Path::new(&args.path).is_absolute() {
+            return Err(ToolErr(format!(
+                "路径 `{}` 不是绝对路径（只接受绝对路径）",
+                args.path
+            )));
+        }
         let target = tokio::fs::canonicalize(&args.path)
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
@@ -372,7 +378,7 @@ const MAX_VISION_CHARS: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 pub struct VisionArgs {
-    /// 要查看的图片路径(绝对路径或相对当前工作目录)
+    /// 要查看的图片路径(必须是绝对路径)
     pub path: String,
 }
 
@@ -425,7 +431,7 @@ impl Tool for Vision {
     type Output = String;
 
     fn description(&self) -> String {
-        "查看本地电脑上的图片文件（按路径指定）：是文字图片则按原结构提取文字，是风景/照片等非文字内容则详细描述图片内容。注意：只用于查看本地电脑上的图片；用户直接发来的图片通常已经能看到，除非消息中明确说明图片已保存到某个本地路径，否则不要调用本工具".into()
+        "查看本地电脑上的图片文件（按绝对路径指定，不接受相对路径）：是文字图片则按原结构提取文字，是风景/照片等非文字内容则详细描述图片内容。注意：只用于查看本地电脑上的图片；用户直接发来的图片通常已经能看到，除非消息中明确说明图片已保存到某个本地路径，否则不要调用本工具".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -434,7 +440,7 @@ impl Tool for Vision {
             "properties": {
                 "path": {
                     "type": "string",
-                    "description": "本地电脑上的图片文件路径（绝对路径，或相对当前工作目录）"
+                    "description": "本地电脑上的图片文件路径（必须是绝对路径，不接受相对路径）"
                 }
             },
             "required": ["path"]
@@ -450,6 +456,13 @@ impl Tool for Vision {
         // 临时目录里的图片是「用户刚发来的图」(主模型非多模态时被转发过来):
         // 用户发图即视为同意看图,免审批;调用结束后(无论成败)自动删除
         let is_temp = is_temp_image_path(&args.path);
+
+        if !Path::new(&args.path).is_absolute() {
+            return Err(ToolErr(format!(
+                "路径 `{}` 不是绝对路径（只接受绝对路径）",
+                args.path
+            )));
+        }
 
         // 先检查文件存在性和大小,避免审批通过后才发现读不到
         let metadata = tokio::fs::metadata(&args.path)
