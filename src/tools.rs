@@ -70,7 +70,7 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
     let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
     // 完整路径只在保存说明里出现一次;命令只给工具名不重复拼路径,省 token
     let cmd_hint = if is_gz {
-        "可用 zcat 查看、zgrep 搜索、sed/tail 截取该文件"
+        "可用 zgrep 查看/搜索该文件"
     } else {
         "可用 cat 查看、grep 搜索、sed/tail 截取该文件"
     };
