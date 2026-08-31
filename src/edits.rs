@@ -1,4 +1,4 @@
-//! 从 pi coding-agent 的 `edit-diff.ts` 移植的编辑核心算法：
+//! 编辑核心算法：
 //! 换行符规范化、BOM 剥离、模糊匹配、多处替换应用、展示向 diff 生成。
 
 use similar::{DiffTag, TextDiff};
@@ -11,7 +11,7 @@ pub struct Edit {
     pub new_text: String,
 }
 
-/// 探测文件换行风格:首个 CRLF 出现在首个独立 LF 之前则为 "\r\n",否则 "\n"(与 pi 的 detectLineEnding 一致)
+/// 探测文件换行风格:首个 CRLF 出现在首个独立 LF 之前则为 "\r\n",否则 "\n"
 pub fn detect_line_ending(content: &str) -> &'static str {
     let lf = content.find('\n');
     let crlf = content.find("\r\n");
@@ -45,7 +45,7 @@ pub fn split_bom(s: &str) -> (&str, &str) {
     }
 }
 
-/// 模糊匹配用的归一化(与 pi 的 normalizeForFuzzyMatch 一致):
+/// 模糊匹配用的归一化:
 /// NFKC + 每行去尾部空白 + 智能引号/破折号/特殊空格归一为 ASCII
 fn fuzzy_char(c: char) -> char {
     match c {
@@ -86,7 +86,7 @@ pub struct FuzzyMatch {
     pub used_fuzzy: bool,
 }
 
-/// 先精确匹配,再在归一化空间模糊匹配(与 pi 的 fuzzyFindText 一致)
+/// 先精确匹配,再在归一化空间模糊匹配
 pub fn fuzzy_find_text(content: &str, old_text: &str) -> Option<FuzzyMatch> {
     if let Some(i) = content.find(old_text) {
         return Some(FuzzyMatch {
@@ -265,7 +265,7 @@ fn no_change_err(path: &str, total: usize) -> String {
     }
 }
 
-/// 在 LF 规范化内容上应用一组精确文本替换(与 pi 的 applyEditsToNormalizedContent 一致)。
+/// 在 LF 规范化内容上应用一组精确文本替换。
 ///
 /// 所有编辑都对着同一份原始内容匹配(不是增量匹配),替换按起点排序后倒序应用;
 /// 任一编辑走了模糊匹配时,在归一化空间做替换再把改动行回贴到原文,
@@ -296,7 +296,7 @@ pub fn apply_edits(
     } else {
         CowStr::Borrowed(normalized_content)
     };
-    // 计数统一在归一化空间做(与 pi 的 countOccurrences 一致)
+    // 计数统一在归一化空间做
     let fuzzy_base = replacement_base.as_ref();
 
     let mut matched: Vec<(usize, TextReplacement)> = Vec::with_capacity(total);
@@ -368,7 +368,7 @@ impl CowStr<'_> {
 // ---------------------------------------------------------------- diff 生成
 
 /// 展示向 diff:带行号、改动前后各保留 context_lines 行上下文、
-/// 过长上下文用 `...` 省略(与 pi 的 generateDiffString 输出格式一致)。
+/// 过长上下文用 `...` 省略。
 /// 返回 (diff 文本, 新文件中第一个被改动行的行号)。
 pub fn generate_diff_string(old: &str, new: &str) -> (String, Option<usize>) {
     const CONTEXT: usize = 4;

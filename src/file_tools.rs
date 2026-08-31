@@ -1,4 +1,4 @@
-//! write / edit 工具,参考 pi coding-agent 的 `tools/write.ts` 与 `tools/edit.ts`:
+//! write / edit 工具:
 //! - write:写入文件(不存在则创建、存在则覆盖),自动建父目录
 //! - edit:基于精确文本替换的多编辑,oldText 必须唯一且不重叠,
 //!   全部编辑对着同一份原始内容匹配(非增量),支持模糊匹配兜底
@@ -137,7 +137,7 @@ fn is_single_edit(v: &serde_json::Value) -> bool {
             .is_some()
 }
 
-/// edits 的宽容反序列化(与 pi 的 prepareEditArguments 一致):
+/// edits 的宽容反序列化:
 /// 部分模型会把 edits 发成 JSON 字符串,或发成单个 {oldText,newText} 对象而非数组
 fn deserialize_edits<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<EditOp>, D::Error> {
     fn from_value(v: serde_json::Value) -> Result<Vec<EditOp>, String> {

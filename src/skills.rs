@@ -49,7 +49,7 @@ impl Skills {
         Self { skills }
     }
 
-    /// 追加到系统提示末尾的文本块(pi 的 <available_skills> 格式);没有 skill 时返回 None。
+    /// 追加到系统提示末尾的 `<available_skills>` 文本块;没有 skill 时返回 None。
     pub fn render_block(&self) -> Option<String> {
         if self.skills.is_empty() {
             return None;

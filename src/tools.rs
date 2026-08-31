@@ -267,7 +267,7 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        // 先检查文件可读性(对应 pi 的 fs.access(R_OK))
+        // 先检查文件可读性
         let mut file = tokio::fs::File::open(&target)
             .await
             .map_err(|e| ToolErr(format!("文件 `{}` 不可读：{e}", args.path)))?;
@@ -276,20 +276,20 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        // 行计数与 pi 一致:split('\n')(末尾换行会多出一个空行,不做特殊处理)
+        // 行计数:split('\n')(末尾换行会多出一个空行,不做特殊处理)
         let all_lines: Vec<&str> = content.split('\n').collect();
         let total = all_lines.len();
         let start = args.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
         let start_display = start + 1;
         if start >= total {
-            // 与 pi 一致:offset 越界是工具错误
+            // offset 越界是工具错误
             return Err(ToolErr(format!(
                 "offset {} 超出文件末尾（共 {total} 行）",
                 args.offset.unwrap_or(0)
             )));
         }
 
-        // 与 pi 一致:用户 limit 先截取,之后仍统一受 2000 行/50KB 上限约束
+        // 用户 limit 先截取,之后仍统一受 2000 行/50KB 上限约束
         let (selected, user_limited): (String, Option<usize>) = match args.limit {
             Some(l) if l > 0 => {
                 let end = (start + l).min(total);
@@ -298,15 +298,15 @@ impl Tool for Read {
             _ => (all_lines[start..].join("\n"), None),
         };
 
-        // 行数统计:末尾换行不产生额外行(与 pi 的 splitLinesForCounting 一致)
+        // 行数统计:末尾换行不产生额外行
         let mut sel_lines: Vec<&str> = selected.split('\n').collect();
         if selected.ends_with('\n') {
             sel_lines.pop();
         }
 
-        // 未超限:原样返回(不带行号前缀,与 pi 一致)
+        // 未超限:原样返回(不带行号前缀)
         if sel_lines.len() <= DEFAULT_READ_LIMIT && selected.len() <= MAX_READ_BYTES {
-            // 未截断但用户 limit 提前停、文件还有剩余:提示续读(与 pi 一致)
+            // 未截断但用户 limit 提前停、文件还有剩余:提示续读
             if let Some(limited) = user_limited {
                 let remaining = total - (start + limited);
                 if remaining > 0 {
@@ -319,7 +319,7 @@ impl Tool for Read {
             return Ok(selected);
         }
 
-        // 首行单行即超 50KB:正常返回提示让 agent 改用 bash(与 pi 一致,不算工具错误)
+        // 首行单行即超 50KB:正常返回提示让 agent 改用 bash(不算工具错误)
         if sel_lines.first().is_some_and(|l| l.len() > MAX_READ_BYTES) {
             return Ok(format!(
                 "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash：`sed -n '{start_display}p' {} | head -c {MAX_READ_BYTES}` 查看]",
