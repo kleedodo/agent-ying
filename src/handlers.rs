@@ -16,6 +16,7 @@ use rig::streaming::StreamedAssistantContent;
 use teloxide::net::Download;
 use teloxide::prelude::*;
 use teloxide::types::{ChatAction, FileId, InlineKeyboardMarkup, MessageId};
+use uuid::Uuid;
 
 use crate::{
     AppState,
@@ -402,6 +403,8 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         if t.starts_with("/new") {
             let mut map = state.histories.lock().await;
             map.remove(&msg.chat.id);
+            // 会话结束:下一条消息会创建新的会话文件
+            state.sessions.lock().await.remove(&msg.chat.id);
             state
                 .bot
                 .send_message(msg.chat.id, "🆕 新会话已开始,之前的对话历史已清空。")
@@ -430,7 +433,29 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     );
 
     let chat_id = msg.chat.id;
-    let agent = state.agent_for(chat_id);
+
+    // 本轮的 round id:journal 里关联本轮全部消息
+    let round_id = Uuid::new_v4();
+    // 当前会话文件:chat 还没有则新建(/new 或进程重启后都会是新文件)
+    let session = {
+        let mut map = state.sessions.lock().await;
+        match map.get(&chat_id).cloned() {
+            Some(s) => s,
+            None => {
+                let s = state
+                    .journal
+                    .create_session(chat_id.0)
+                    .await
+                    .map_err(|e| format!("创建 journal 会话文件失败: {e}"))?;
+                map.insert(chat_id, s.clone());
+                s
+            }
+        }
+    };
+    let agent = state.agent_for(chat_id, session.toolout_dir());
+
+    // 流异常(拿不到 FinalResponse)时,至少把本轮用户消息记进 journal
+    let logged_user_msg = user_msg.clone();
 
     // 先发「正在输入」状态,让用户立刻有反馈;
     // 占位消息改为每轮首个文本到达时懒创建(见下方 placeholder)
@@ -546,13 +571,20 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                 .bot
                 .send_message(chat_id, format!("⚠️ Agent 出错: {e}"))
                 .await?;
+            // 异常轮次只记用户消息
+            session
+                .append_round(round_id, std::slice::from_ref(&logged_user_msg))
+                .await;
             // 本轮收尾:审批日志消息追加「🏁 本轮结束」尾注(本轮无审批则不做任何事)
             state.approvals.finish_run(&state.bot, chat_id).await;
             return Ok(());
         }
         (None, Some(resp)) => {
             // resp.messages 是本轮新增消息(含用户输入),接在旧历史后面
-            history.extend(resp.messages.unwrap_or_default());
+            let new_messages = resp.messages.unwrap_or_default();
+            history.extend(new_messages.clone());
+            // 本轮全部消息追加进 journal(只追加、不修改)
+            session.append_round(round_id, &new_messages).await;
             resp.output
         }
         (None, None) => {
@@ -566,6 +598,10 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                     .bot
                     .send_message(chat_id, "⚠️ Agent 出错: 流结束但没有最终响应")
                     .await?;
+                // 异常轮次只记用户消息
+                session
+                    .append_round(round_id, std::slice::from_ref(&logged_user_msg))
+                    .await;
                 state.approvals.finish_run(&state.bot, chat_id).await;
                 return Ok(());
             }

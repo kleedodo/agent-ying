@@ -47,3 +47,4 @@ mimalloc = "0.1"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 unicode-normalization = "0.1.25"
 similar = "3.2.0"
+flate2 = "1.1.10"

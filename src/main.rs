@@ -3,6 +3,7 @@ mod config;
 mod edits;
 mod file_tools;
 mod handlers;
+mod journal;
 mod skills;
 mod tools;
 
@@ -21,6 +22,7 @@ use approval::ApprovalManager;
 use config::Config;
 use file_tools::{Edit, Write};
 use handlers::{on_callback, on_message, on_unmatched};
+use journal::Journal;
 use mimalloc::MiMalloc;
 use skills::Skills;
 use tools::{Bash, Read, ToolCtx, Vision};
@@ -38,6 +40,10 @@ struct AppState {
     client: openai::CompletionsClient,
     approvals: ApprovalManager,
     histories: Arc<Mutex<HashMap<ChatId, Vec<Message>>>>,
+    /// 会话日志(journals/)记录器
+    journal: Journal,
+    /// 每个 chat 当前会话的 journal 文件;/new 后重新创建
+    sessions: Arc<Mutex<HashMap<ChatId, journal::SessionFile>>>,
     name: String,
     model: String,
     /// 是否把用户发来的图片转发给 vision 工具;true 且 vision 已启用时,图片存临时文件并转发
@@ -65,13 +71,14 @@ impl AppState {
 }
 
 impl AppState {
-    fn agent_for(&self, chat_id: ChatId) -> YingAgent {
+    fn agent_for(&self, chat_id: ChatId, toolout_dir: std::path::PathBuf) -> YingAgent {
         let ctx = ToolCtx {
             bot: self.bot.clone(),
             chat_id,
             approvals: self.approvals.clone(),
             bash_timeout: self.bash_timeout,
             approval_timeout: self.approval_timeout,
+            toolout_dir,
         };
         let mut builder = self
             .client
@@ -79,7 +86,7 @@ impl AppState {
             .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
-            .tool(Read)
+            .tool(Read(ctx.clone()))
             .tool(Write(ctx.clone()))
             .tool(Edit(ctx.clone()));
         // vision_model 留空(或省略)则不启用 vision agent
@@ -219,6 +226,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         client,
         approvals: ApprovalManager::new(),
         histories: Arc::new(Mutex::new(HashMap::new())),
+        journal: Journal::new(),
+        sessions: Arc::new(Mutex::new(HashMap::new())),
         name: config.name,
         model: config.model,
         forward_to_vision: config.forward_to_vision,

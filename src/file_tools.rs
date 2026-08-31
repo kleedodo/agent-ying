@@ -11,7 +11,7 @@ use serde::de::Deserializer;
 
 use crate::approval::request_approval;
 use crate::edits::{self, Edit as EditData};
-use crate::tools::{ToolCtx, ToolErr, human_size};
+use crate::tools::{ToolCtx, ToolErr, human_size, record_tool_result};
 
 // --------------------------------------------------------------------- write
 
@@ -96,7 +96,7 @@ impl Tool for Write {
             ));
         }
 
-        tracing::info!("write 写入:{}", args.path);
+        tracing::info!("write 开始写入:{}", args.path);
         // 先建父目录再落盘
         if let Some(dir) = Path::new(&args.path).parent()
             && !dir.as_os_str().is_empty()
@@ -109,11 +109,12 @@ impl Tool for Write {
             .await
             .map_err(|e| ToolErr(format!("写入文件 `{}` 失败:{e}", args.path)))?;
 
-        Ok(format!(
+        let report = format!(
             "Successfully wrote {} bytes to `{}`.",
             args.content.len(),
             args.path
-        ))
+        );
+        record_tool_result(&ctx.toolout_dir, &report).await
     }
 }
 
@@ -294,10 +295,11 @@ impl Tool for Edit {
             .await
             .map_err(|e| ToolErr(format!("Could not write file `{}`: {e}", args.path)))?;
 
-        Ok(format!(
+        let report = format!(
             "Successfully replaced {} block(s) in `{}`.",
             args.edits.len(),
             args.path
-        ))
+        );
+        record_tool_result(&ctx.toolout_dir, &report).await
     }
 }

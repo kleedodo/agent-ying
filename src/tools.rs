@@ -22,48 +22,72 @@ use uuid::Uuid;
 use crate::approval::{ApprovalManager, request_approval};
 use crate::handlers::{compress_image, is_temp_image_path};
 
-/// bash 输出超过该字符数时落盘并返回头尾摘要
-/// 输出会进多轮历史、每轮重复送给模型,故阈值偏保守:够多数命令用,超出就落盘让模型按需取
+/// 工具输出超过该字符数时返回头尾摘要(全文始终落盘)
+/// 输出会进多轮历史、每轮重复送给模型,故阈值偏保守:够多数命令用,超出就只给摘要让模型按需取
 const MAX_OUTPUT_CHARS: usize = 8000;
 /// 落盘后返回摘要中保留的头部字符数(与尾部之和须小于 MAX_OUTPUT_CHARS)
 const SPILL_HEAD_CHARS: usize = 3000;
 /// 落盘后返回摘要中保留的尾部字符数
 const SPILL_TAIL_CHARS: usize = 2000;
 
-/// bash 超长输出的落盘目录
-const TOOL_OUT_DIR: &str = "/tmp/agent-ying/tool-out";
-
 #[derive(Debug, Error)]
 #[error("{0}")]
 pub struct ToolErr(pub String);
 
-/// 输出未超长时原样返回;超长则把完整内容写入
-/// `/tmp/agent-ying/tool-out/<uuid>.txt`,返回头 + 尾摘要和完整文件路径,
-/// 模型可以用 bash 工具(sed/grep/tail)自行查看被省略的部分。
-async fn truncate_or_spill(s: &str) -> Result<String, ToolErr> {
-    let total = s.chars().count();
-    if total <= MAX_OUTPUT_CHARS {
-        return Ok(s.to_string());
-    }
+/// 单个落盘文件的硬上限:完整输出超过该字节数时只保存前 256MB(按字符边界截断)
+const MAX_SPILL_BYTES: usize = 256 * 1024 * 1024;
 
-    let dir = Path::new(TOOL_OUT_DIR);
-    tokio::fs::create_dir_all(dir)
-        .await
-        .map_err(|e| ToolErr(format!("创建落盘目录 {} 失败：{e}", dir.display())))?;
-    let path = dir.join(format!("{}.txt", Uuid::new_v4()));
-    tokio::fs::write(&path, s)
+/// 所有工具结果都全文落盘到会话的 `toolout/` 目录(见 ToolCtx::toolout_dir):
+/// 超过 [crate::journal::COMPRESS_MIN_BYTES] 的 gzip 压缩为 `<uuid>.txt.gz`,更小的保留纯文本 `<uuid>.txt`。
+/// 返回给模型的文本始终注明完整结果存在哪里:未超长时原样返回 + 保存路径;
+/// 超长时返回头 + 尾摘要和完整文件路径,模型可以用 bash 工具自行查看被省略的部分。
+pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> {
+    let id = Uuid::new_v4().simple().to_string();
+
+    // 单文件硬上限:只保存前 256MB(不跨字符边界)
+    let end = s.floor_char_boundary(MAX_SPILL_BYTES.min(s.len()));
+    let spill = &s[..end];
+    let capped_note = if end < s.len() {
+        format!("完整输出共 {} 字节,仅保存了前 256MB。", s.len())
+    } else {
+        String::new()
+    };
+    let data = spill.as_bytes().to_vec();
+
+    // 超过 50KB 才 gzip 压缩,小文件保留纯文本直接可读
+    let (path, payload) = if data.len() > crate::journal::COMPRESS_MIN_BYTES {
+        let compressed = tokio::task::spawn_blocking(move || crate::journal::gzip_bytes(&data))
+            .await
+            .map_err(|e| ToolErr(format!("gzip 任务 join 失败：{e}")))?;
+        (dir.join(format!("{id}.txt.gz")), compressed)
+    } else {
+        (dir.join(format!("{id}.txt")), data)
+    };
+    tokio::fs::write(&path, &payload)
         .await
         .map_err(|e| ToolErr(format!("写入完整输出 {} 失败：{e}", path.display())))?;
+
+    let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
+    // 完整路径只在保存说明里出现一次;命令只给工具名不重复拼路径,省 token
+    let cmd_hint = if is_gz {
+        "可用 zcat 查看、zgrep 搜索、sed/tail 截取该文件"
+    } else {
+        "可用 cat 查看、grep 搜索、sed/tail 截取该文件"
+    };
+
+    let total = s.chars().count();
+    if total <= MAX_OUTPUT_CHARS {
+        return Ok(format!(
+            "{s}\n\n（完整结果已保存到 {}。{capped_note}{cmd_hint}。）",
+            path.display()
+        ));
+    }
 
     let head: String = s.chars().take(SPILL_HEAD_CHARS).collect();
     let tail: String = s.chars().skip(total - SPILL_TAIL_CHARS).collect();
     let dropped = total - SPILL_HEAD_CHARS - SPILL_TAIL_CHARS;
     Ok(format!(
-        "{head}\n…（共 {total} 字符，中间省略 {dropped} 字符；完整输出已保存到 {}，\n\
-         可用 `sed -n '200,300p' {}` 查看指定行、`grep 关键词 {}` 搜索、`tail -n 50 {}` 看结尾）\n{tail}",
-        path.display(),
-        path.display(),
-        path.display(),
+        "{head}\n…（共 {total} 字符，中间省略 {dropped} 字符；完整输出已保存到 {}。{capped_note}{cmd_hint}。）\n{tail}",
         path.display()
     ))
 }
@@ -76,6 +100,8 @@ pub struct ToolCtx {
     pub approvals: ApprovalManager,
     pub bash_timeout: std::time::Duration,
     pub approval_timeout: std::time::Duration,
+    /// 当前会话的 toolout/ 目录,所有工具结果的全文都落盘到这里
+    pub toolout_dir: std::path::PathBuf,
 }
 
 // --------------------------------------------------------------------- bash
@@ -169,7 +195,7 @@ impl Tool for Bash {
                     report.push_str("\n--- stderr ---\n");
                     report.push_str(&stderr);
                 }
-                Ok(truncate_or_spill(&report).await?)
+                Ok(record_tool_result(&ctx.toolout_dir, &report).await?)
             }
             Ok(Err(e)) => Err(ToolErr(format!("命令启动失败：{e}"))),
             Err(_) => {
@@ -207,7 +233,7 @@ pub struct ReadArgs {
 
 /// 只读一个文本文件(skills 文件或其他任意文件),只读无副作用,免审批。
 #[derive(Clone)]
-pub struct Read;
+pub struct Read(pub ToolCtx);
 
 impl std::fmt::Debug for Read {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -257,6 +283,7 @@ impl Tool for Read {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        let ctx = &self.0;
         if !Path::new(&args.path).is_absolute() {
             return Err(ToolErr(format!(
                 "路径 `{}` 不是绝对路径（只接受绝对路径）",
@@ -311,22 +338,30 @@ impl Tool for Read {
                 let remaining = total - (start + limited);
                 if remaining > 0 {
                     let next = start + limited + 1;
-                    return Ok(format!(
-                        "{selected}\n\n[文件还有 {remaining} 行。使用 offset={next} 继续。]"
-                    ));
+                    return record_tool_result(
+                        &ctx.toolout_dir,
+                        &format!(
+                            "{selected}\n\n[文件还有 {remaining} 行。使用 offset={next} 继续。]"
+                        ),
+                    )
+                    .await;
                 }
             }
-            return Ok(selected);
+            return record_tool_result(&ctx.toolout_dir, &selected).await;
         }
 
         // 首行单行即超 50KB:正常返回提示让 agent 改用 bash(不算工具错误)
         if sel_lines.first().is_some_and(|l| l.len() > MAX_READ_BYTES) {
-            return Ok(format!(
-                "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash：`sed -n '{start_display}p' {} | head -c {MAX_READ_BYTES}` 查看]",
-                human_size(sel_lines[0].len() as u64),
-                human_size(MAX_READ_BYTES as u64),
-                args.path
-            ));
+            return record_tool_result(
+                &ctx.toolout_dir,
+                &format!(
+                    "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash：`sed -n '{start_display}p' {} | head -c {MAX_READ_BYTES}` 查看]",
+                    human_size(sel_lines[0].len() as u64),
+                    human_size(MAX_READ_BYTES as u64),
+                    args.path
+                ),
+            )
+            .await;
         }
 
         // 从头收集完整行,直到达到行数或字节上限(永不返回半行)
@@ -354,7 +389,7 @@ impl Tool for Read {
                 human_size(MAX_READ_BYTES as u64)
             ));
         }
-        Ok(out)
+        record_tool_result(&ctx.toolout_dir, &out).await
     }
 }
 
@@ -372,9 +407,6 @@ pub fn human_size(bytes: u64) -> String {
 }
 
 // -------------------------------------------------------------------- vision
-
-/// vision 工具输出上限:8K 字符
-const MAX_VISION_CHARS: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 pub struct VisionArgs {
@@ -546,14 +578,8 @@ impl Tool for Vision {
                 reply.chars().count()
             );
 
-            // 6. 截断过长的输出
-            if reply.chars().count() <= MAX_VISION_CHARS {
-                Ok(reply)
-            } else {
-                let mut out: String = reply.chars().take(MAX_VISION_CHARS).collect();
-                out.push_str("\n…（已截断）");
-                Ok(out)
-            }
+            // 6. 全文落盘并注明保存位置,超长则返回头尾摘要
+            record_tool_result(&ctx.toolout_dir, &reply).await
         }
         .await;
 

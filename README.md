@@ -128,6 +128,29 @@ vision agent(看图工具)有自己独立的系统提示词,同样支持覆盖:
 
 技能文件里引用相对路径时,以技能目录(SKILL.md 的父目录)为基准解析;`read` 只读、免审批。
 
+## 会话日志(Journals)
+
+每一轮对话的全部消息(用户输入、assistant 中间轮、工具调用与结果)以 jsonl 追加写入,只追加、不修改,便于事后审计与回放。每个会话一个文件,`/new` 开启新会话后写入新文件(进程重启同理)。
+
+目录布局(按会话创建时的月份分子目录,每个会话一个自包含目录):
+
+```
+~/.agent-ying/journals/
+└── 2026-08/
+    └── session-123-ab3f9c2d/
+        ├── messages.jsonl           # 每行一条消息:{ts, round, seq, msg}
+        ├── messages-*.jsonl.gz      # jsonl 超 1MB 后轮转压缩而来
+        ├── toolout/                 # 工具结果全文:<uuid>.txt,超 50KB 的 gzip 为 <uuid>.txt.gz
+        └── images/                  # 用户发来的图片,<uuid>.jpg
+```
+
+- `round` 是本轮的 uuid(每次用户消息一个),`seq` 是轮内序号;流异常时至少会记录用户消息
+- 工具结果:文本完整写入 jsonl(即 agent 看到的内容;工具侧已把长输出截成头尾摘要、原始全文落 `toolout/`);若文本里带保存位置,附 `result_ref` 指向 `toolout/` 里的原始全文文件
+- 图片:base64 不留在 jsonl 里,解码后存入同级 `images/`,消息里只留 `image_ref: "images/<uuid>.jpg"`
+- 另外,所有工具返回给模型前都会把全文落盘到当前会话的 `toolout/<uuid>.txt.gz`,并在返回文本中注明保存位置(超长时返回头尾摘要),模型可用 bash 按需查看
+- toolout 文件超过 50KB 才 gzip 压缩(小结果保留纯文本),轮转的 jsonl 一律 gzip;压缩文件可用 `zgrep 关键词 …` 搜索、`zcat` 查看;单个工具结果最多保存前 256MB
+- 没有定期清理;需要腾空间时按会话目录(或月目录)整删即可,会话目录是自包含单位,引用都是相对路径,搬走不会失效
+
 ## 项目结构
 
 ```
@@ -135,7 +158,10 @@ src/
 ├── main.rs      # 入口:配置加载、agent 构建、dptree handler 注册
 ├── config.rs    # ~/.agent-ying/config.json 的加载与默认模板
 ├── handlers.rs  # Telegram 消息 / 按钮回调处理
-├── tools.rs     # rig 工具:bash、read、vision
+├── journal.rs   # 会话日志:每会话一个 jsonl,只追加;图片/超长工具结果落盘
+├── tools.rs     # rig 工具:bash、read、vision;工具结果统一落盘 toolout/
+├── file_tools.rs# rig 工具:write、edit
+├── edits.rs     # edit 工具的匹配 / diff 逻辑
 ├── skills.rs    # 扫描 ~/.agent-ying/skills/,生成系统提示里的技能索引
 └── approval.rs  # 工具执行前的 Telegram 按钮审批
 ```

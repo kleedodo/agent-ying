@@ -191,6 +191,11 @@ impl Config {
         Self::dir().join("skills")
     }
 
+    /// journals 根目录(固定为 `~/.agent-ying/journals/`),按 YYYY-MM 分子目录记录会话
+    pub fn journals_dir() -> PathBuf {
+        Self::dir().join("journals")
+    }
+
     pub fn path() -> PathBuf {
         Self::dir().join("config.json")
     }
