@@ -1,7 +1,5 @@
 mod approval;
 mod config;
-mod edits;
-mod file_tools;
 mod handlers;
 mod journal;
 mod skills;
@@ -20,12 +18,11 @@ use tokio::sync::Mutex;
 
 use approval::ApprovalManager;
 use config::Config;
-use file_tools::{Edit, Write};
 use handlers::{on_callback, on_message, on_unmatched};
 use journal::Journal;
 use mimalloc::MiMalloc;
 use skills::Skills;
-use tools::{Bash, Read, ToolCtx, Vision};
+use tools::{Bash, Edit, Read, ToolCtx, Vision, Write};
 
 // 用 mimalloc 替换系统默认分配器（减少内存碎片，降低常驻内存）
 #[global_allocator]
