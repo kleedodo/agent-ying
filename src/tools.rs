@@ -16,6 +16,7 @@ use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 use teloxide::prelude::*;
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::approval::{ApprovalManager, request_approval};
@@ -224,8 +225,8 @@ impl Tool for Read {
     fn description(&self) -> String {
         format!(
             "读取一个文本文件（如 SKILL.md 或其他任意文件）：路径为绝对路径，或相对当前工作目录。\
-             返回内容带行号前缀；从第 1 行起最多读 {} 行或 50KB（先到者为准），\
-             截断时会附提示，可用 offset（起始行号）续读，也可用 limit 指定行数",
+             返回原始内容（不带行号前缀）；默认最多读 {} 行或 50KB（先到者为准），\
+             截断时会附提示，可用 offset（起始行号，1 起）续读，也可用 limit 指定行数",
             DEFAULT_READ_LIMIT
         )
     }
@@ -260,53 +261,91 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        let content = tokio::fs::read_to_string(&target)
+        // 先检查文件可读性(对应 pi 的 fs.access(R_OK))
+        let mut file = tokio::fs::File::open(&target)
+            .await
+            .map_err(|e| ToolErr(format!("文件 `{}` 不可读：{e}", args.path)))?;
+        let mut content = String::new();
+        file.read_to_string(&mut content)
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        // 按行分页:offset(1 起)~ offset+limit,输出带行号前缀
-        let offset = args.offset.unwrap_or(1).max(1);
-        let limit = args.limit.unwrap_or(DEFAULT_READ_LIMIT).max(1);
-        let lines: Vec<&str> = content.lines().collect();
-        let total = lines.len();
-        let start = offset.saturating_sub(1);
+        // 行计数与 pi 一致:split('\n')(末尾换行会多出一个空行,不做特殊处理)
+        let all_lines: Vec<&str> = content.split('\n').collect();
+        let total = all_lines.len();
+        let start = args.offset.map(|o| o.saturating_sub(1)).unwrap_or(0);
+        let start_display = start + 1;
         if start >= total {
-            return Ok(format!(
-                "（文件共 {total} 行，起始行 {} 已超出文件末尾）",
-                offset
-            ));
+            // 与 pi 一致:offset 越界是工具错误
+            return Err(ToolErr(format!(
+                "offset {} 超出文件末尾（共 {total} 行）",
+                args.offset.unwrap_or(0)
+            )));
         }
-        let mut end = (start + limit).min(total);
-        // 输出达到 50KB 即截断(与行数上限取先到者)
-        {
-            let mut size = 0usize;
-            for (i, line) in lines[start..end].iter().enumerate() {
-                // 每行输出为 "行号：内容\n",按字节估算
-                size += (start + i + 1).to_string().len() + 3 + line.len();
-                if size > MAX_READ_BYTES {
-                    if i == 0 {
-                        // 单行即超 50KB,read 不适合,让 agent 改用 bash
-                        return Err(ToolErr(format!(
-                            "第 {} 行单行即超过 50KB，read 不适合读取，请改用 bash 工具（grep/sed/head 等）读取",
-                            start + 1
-                        )));
-                    }
-                    end = start + i;
-                    break;
+
+        // 与 pi 一致:用户 limit 先截取,之后仍统一受 2000 行/50KB 上限约束
+        let (selected, user_limited): (String, Option<usize>) = match args.limit {
+            Some(l) if l > 0 => {
+                let end = (start + l).min(total);
+                (all_lines[start..end].join("\n"), Some(end - start))
+            }
+            _ => (all_lines[start..].join("\n"), None),
+        };
+
+        // 行数统计:末尾换行不产生额外行(与 pi 的 splitLinesForCounting 一致)
+        let mut sel_lines: Vec<&str> = selected.split('\n').collect();
+        if selected.ends_with('\n') {
+            sel_lines.pop();
+        }
+
+        // 未超限:原样返回(不带行号前缀,与 pi 一致)
+        if sel_lines.len() <= DEFAULT_READ_LIMIT && selected.len() <= MAX_READ_BYTES {
+            // 未截断但用户 limit 提前停、文件还有剩余:提示续读(与 pi 一致)
+            if let Some(limited) = user_limited {
+                let remaining = total - (start + limited);
+                if remaining > 0 {
+                    let next = start + limited + 1;
+                    return Ok(format!(
+                        "{selected}\n\n[文件还有 {remaining} 行。使用 offset={next} 继续。]"
+                    ));
                 }
             }
+            return Ok(selected);
         }
-        let mut out = String::new();
-        for (i, line) in lines[start..end].iter().enumerate() {
-            out.push_str(&format!("{}: {}\n", start + i + 1, line));
+
+        // 首行单行即超 50KB:正常返回提示让 agent 改用 bash(与 pi 一致,不算工具错误)
+        if sel_lines.first().is_some_and(|l| l.len() > MAX_READ_BYTES) {
+            return Ok(format!(
+                "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash：`sed -n '{start_display}p' {} | head -c {MAX_READ_BYTES}` 查看]",
+                human_size(sel_lines[0].len() as u64),
+                human_size(MAX_READ_BYTES as u64),
+                args.path
+            ));
         }
-        if end < total {
+
+        // 从头收集完整行,直到达到行数或字节上限(永不返回半行)
+        let mut out_lines: Vec<&str> = Vec::new();
+        let mut bytes = 0usize;
+        for (i, line) in sel_lines.iter().enumerate().take(DEFAULT_READ_LIMIT) {
+            let line_bytes = line.len() + if i > 0 { 1 } else { 0 };
+            if bytes + line_bytes > MAX_READ_BYTES {
+                break;
+            }
+            out_lines.push(line);
+            bytes += line_bytes;
+        }
+        let output_lines = out_lines.len();
+        let end_display = start_display + output_lines - 1;
+        let next_offset = end_display + 1;
+        let mut out = out_lines.join("\n");
+        if output_lines >= DEFAULT_READ_LIMIT {
             out.push_str(&format!(
-                "[显示第 {}-{} 行，共 {} 行。使用 offset={} 继续。]",
-                start + 1,
-                end,
-                total,
-                end + 1
+                "\n\n[显示第 {start_display}-{end_display} 行，共 {total} 行。使用 offset={next_offset} 继续。]"
+            ));
+        } else {
+            out.push_str(&format!(
+                "\n\n[显示第 {start_display}-{end_display} 行，共 {total} 行（{} 上限）。使用 offset={next_offset} 继续。]",
+                human_size(MAX_READ_BYTES as u64)
             ));
         }
         Ok(out)
