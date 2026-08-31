@@ -13,6 +13,15 @@ use crate::approval::request_approval;
 use crate::edits::{self, Edit as EditData};
 use crate::tools::{ToolCtx, ToolErr, human_size, record_tool_result};
 
+/// 审批卡片用的内容预览：最多取 max_chars 个字符，超长加省略号
+fn preview(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(max_chars).collect::<String>())
+    }
+}
+
 // --------------------------------------------------------------------- write
 
 #[derive(Debug, Deserialize)]
@@ -80,9 +89,10 @@ impl Tool for Write {
             ctx.approval_timeout,
             "write",
             &format!(
-                "写文件：`{}`（{} 字节）",
+                "写文件：`{}`（{} 字节）\n{}",
                 args.path,
-                human_size(args.content.len() as u64)
+                human_size(args.content.len() as u64),
+                preview(&args.content, 100),
             ),
         )
         .await
@@ -266,13 +276,30 @@ impl Tool for Edit {
         let applied = edits::apply_edits(&normalized, &data, &args.path).map_err(ToolErr)?;
         let (diff, _) = edits::generate_diff_string(&applied.base, &applied.new);
 
+        // 摘要：改动行数从 diff 文本统计（+N/-N 前缀行）
+        let added = diff.lines().filter(|l| l.starts_with('+')).count();
+        let removed = diff.lines().filter(|l| l.starts_with('-')).count();
+        let mut lines = vec![format!(
+            "编辑文件：`{}`（{} 处改动，+{added}/-{removed} 行）",
+            args.path,
+            args.edits.len()
+        )];
+        for (i, e) in args.edits.iter().enumerate() {
+            lines.push(format!(
+                "[{}] {} → {}",
+                i + 1,
+                preview(&e.old_text, 100),
+                preview(&e.new_text, 100)
+            ));
+        }
+
         let approved = request_approval(
             &ctx.bot,
             ctx.chat_id,
             &ctx.approvals,
             ctx.approval_timeout,
             "edit",
-            &format!("编辑文件：`{}`\n{diff}", args.path),
+            &lines.join("\n"),
         )
         .await
         .map_err(ToolErr)?;

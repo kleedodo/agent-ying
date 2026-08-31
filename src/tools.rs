@@ -297,7 +297,12 @@ impl Tool for Read {
             &ctx.approvals,
             ctx.approval_timeout,
             "read",
-            &format!("读取文件：`{}`", args.path),
+            &format!(
+                "读取文件：`{}`（offset={}，limit={limit}）",
+                args.path,
+                args.offset.unwrap_or(1),
+                limit = args.limit.filter(|l| *l > 0).unwrap_or(DEFAULT_READ_LIMIT),
+            ),
         )
         .await
         .map_err(ToolErr)?;
