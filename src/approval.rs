@@ -7,10 +7,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use rig::agent::hook::{AgentHook, HookContext, ToolCall, ToolCallAction};
+use serde_json::Value;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Duration;
+
+use crate::tools::edit::EditArgs;
+use crate::tools::edit_algo::{self, Edit as EditData};
+use crate::tools::read::DEFAULT_READ_LIMIT;
+use crate::tools::{human_size, preview};
 
 /// Telegram 单条消息上限 4096 字符，留点余量
 const MAX_LOG_LEN: usize = 3800;
@@ -353,6 +360,189 @@ pub async fn request_approval(
     Ok(approved)
 }
 
+/// 审批钩子（rig `AgentHook`）：每个工具**体**执行前触发，统一做 Telegram 按钮审批。
+/// 同意 → `Run`（执行工具体）；拒绝/超时 → `Skip`（工具体不执行，理由原样喂回模型）；
+/// 审批消息都发不出去 → `Stop` 结束本轮（用户没看到审批卡，继续跑没意义）。
+/// 审批是「run 级策略」，工具本身不需要知道它的存在。
+#[derive(Clone)]
+pub struct ApprovalHook {
+    bot: Bot,
+    chat_id: ChatId,
+    approvals: ApprovalManager,
+    timeout: Duration,
+}
+
+impl ApprovalHook {
+    pub fn new(bot: Bot, chat_id: ChatId, approvals: ApprovalManager, timeout: Duration) -> Self {
+        Self {
+            bot,
+            chat_id,
+            approvals,
+            timeout,
+        }
+    }
+}
+
+impl AgentHook for ApprovalHook {
+    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
+        let args: Value = serde_json::from_str(event.args).unwrap_or(Value::Null);
+        let detail = describe_detail(event.tool_name, &args).await;
+        match request_approval(
+            &self.bot,
+            self.chat_id,
+            &self.approvals,
+            self.timeout,
+            event.tool_name,
+            &detail,
+        )
+        .await
+        {
+            Ok(true) => ToolCallAction::run(),
+            Ok(false) => {
+                let target = describe_target(event.tool_name, &args);
+                tracing::info!("{target} 被用户拒绝");
+                ToolCallAction::skip(format!("用户拒绝了{target}，立即停止尝试并追问用户原因。"))
+            }
+            Err(e) => {
+                tracing::error!("审批请求发送失败： {e}");
+                ToolCallAction::stop(format!("审批请求发送失败： {e}"))
+            }
+        }
+    }
+}
+
+/// 审批卡片内容：按工具名把参数 JSON 渲染成人类可读的详情。
+async fn describe_detail(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "bash" => args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|c| format!("执行命令：`{c}`"))
+            .unwrap_or_else(|| fallback_detail(tool_name, args)),
+        "read" => match args.get("path").and_then(Value::as_str) {
+            Some(p) => {
+                let offset = args
+                    .get("offset")
+                    .and_then(Value::as_u64)
+                    .map(|o| o as usize)
+                    .unwrap_or(1);
+                let limit = args
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .filter(|l| *l > 0)
+                    .map(|l| l as usize)
+                    .unwrap_or(DEFAULT_READ_LIMIT);
+                format!("读取文件：`{p}`（offset={offset}，limit={limit}）")
+            }
+            None => fallback_detail(tool_name, args),
+        },
+        "write" => match (
+            args.get("path").and_then(Value::as_str),
+            args.get("content").and_then(Value::as_str),
+        ) {
+            (Some(p), Some(c)) => format!(
+                "写文件：`{p}`（{} 字节）\n{}",
+                human_size(c.len() as u64),
+                preview(c, 100)
+            ),
+            _ => fallback_detail(tool_name, args),
+        },
+        "edit" => edit_detail(args).await,
+        "vision" => match args.get("path").and_then(Value::as_str) {
+            Some(p) => {
+                let size_note = tokio::fs::metadata(p)
+                    .await
+                    .ok()
+                    .filter(|m| m.is_file())
+                    .map(|m| format!("（{}）", human_size(m.len())))
+                    .unwrap_or_default();
+                format!("看图：`{p}`{size_note}")
+            }
+            None => fallback_detail(tool_name, args),
+        },
+        other => fallback_detail(other, args),
+    }
+}
+
+/// edit 审批卡片：能读到文件就先算好 diff（改动行数 + 每条编辑的预览），
+/// 读不到/应用失败则只展示文件路径和编辑条数。
+async fn edit_detail(args: &Value) -> String {
+    let Ok(a) = serde_json::from_value::<EditArgs>(args.clone()) else {
+        return fallback_detail("edit", args);
+    };
+    let mut lines = vec![format!("编辑文件：`{}`（{} 处改动", a.path, a.edits.len())];
+    if let Ok(raw) = tokio::fs::read_to_string(&a.path).await {
+        let (_bom, content) = edit_algo::split_bom(&raw);
+        let normalized = edit_algo::normalize_to_lf(content);
+        let data: Vec<EditData> = a
+            .edits
+            .iter()
+            .map(|e| EditData {
+                old_text: e.old_text.clone(),
+                new_text: e.new_text.clone(),
+            })
+            .collect();
+        if let Ok(applied) = edit_algo::apply_edits(&normalized, &data, &a.path) {
+            let (diff, _) = edit_algo::generate_diff_string(&applied.base, &applied.new);
+            let added = diff.lines().filter(|l| l.starts_with('+')).count();
+            let removed = diff.lines().filter(|l| l.starts_with('-')).count();
+            lines[0].push_str(&format!("，+{added}/-{removed} 行）"));
+            for (i, e) in a.edits.iter().enumerate() {
+                lines.push(format!(
+                    "[{}] {} → {}",
+                    i + 1,
+                    preview(&e.old_text, 100),
+                    preview(&e.new_text, 100)
+                ));
+            }
+            return lines.join("\n");
+        }
+    }
+    lines[0].push('）');
+    lines.join("\n")
+}
+
+/// 参数缺失/解析失败时的兜底详情：直接把原始参数 JSON 展示出来。
+fn fallback_detail(tool_name: &str, args: &Value) -> String {
+    if args.is_null() {
+        format!("调用工具 {tool_name}")
+    } else {
+        format!("调用工具 {tool_name}：{args}")
+    }
+}
+
+/// 拒绝反馈里用的调用目标描述（与审批卡片的措辞一致）。
+fn describe_target(tool_name: &str, args: &Value) -> String {
+    match tool_name {
+        "bash" => args
+            .get("command")
+            .and_then(Value::as_str)
+            .map(|c| format!("执行命令 `{c}`"))
+            .unwrap_or_else(|| "这次 bash 调用".into()),
+        "read" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|p| format!("读取文件 `{p}`"))
+            .unwrap_or_else(|| "这次 read 调用".into()),
+        "write" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|p| format!("写文件 `{p}`"))
+            .unwrap_or_else(|| "这次 write 调用".into()),
+        "edit" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|p| format!("编辑文件 `{p}`"))
+            .unwrap_or_else(|| "这次 edit 调用".into()),
+        "vision" => args
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|p| format!("看图 `{p}`"))
+            .unwrap_or_else(|| "这次 vision 调用".into()),
+        other => format!("调用工具 {other}"),
+    }
+}
+
 /// 从日志消息原文里提取记录内容：去掉开头的 🔧 和「是否放行？」之后的行。
 /// 仅用于进程重启后旧按钮点击的兜底展示。
 pub fn approval_body(original: &str) -> String {
@@ -368,6 +558,7 @@ pub fn approval_body(original: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn decided(tool: &str, detail: &str) -> Entry {
         Entry {
@@ -426,6 +617,83 @@ mod tests {
         assert!(pending.is_none());
         assert!(text.contains("🏁 本轮结束，共 1 次审批"));
         assert!(!text.contains("是否放行？"));
+    }
+
+    #[tokio::test]
+    async fn describe_detail_renders_known_tools() {
+        let bash = json!({ "command": "git status" });
+        assert_eq!(
+            describe_detail("bash", &bash).await,
+            "执行命令：`git status`"
+        );
+
+        let read = json!({ "path": "/tmp/a.txt", "offset": 5 });
+        assert_eq!(
+            describe_detail("read", &read).await,
+            format!("读取文件：`/tmp/a.txt`（offset=5，limit={DEFAULT_READ_LIMIT}）")
+        );
+
+        let write = json!({ "path": "/tmp/a.txt", "content": "hello\n" });
+        let detail = describe_detail("write", &write).await;
+        // human_size 会渲染成 `6B`，与原有审批卡片的措辞保持一致
+        assert!(detail.starts_with("写文件：`/tmp/a.txt`（6B 字节）\nhello"));
+
+        // 未注册的工具走兜底：展示原始参数
+        let other = json!({ "x": 1 });
+        assert_eq!(
+            describe_detail("mystery", &other).await,
+            "调用工具 mystery：{\"x\":1}"
+        );
+        assert_eq!(
+            describe_detail("mystery", &Value::Null).await,
+            "调用工具 mystery"
+        );
+    }
+
+    #[tokio::test]
+    async fn describe_detail_edit_shows_diff_and_falls_back_without_file() {
+        // 能读到文件：带上改动行数和每条编辑的预览
+        let dir = std::env::temp_dir().join(format!("ying-hook-test-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("a.txt");
+        tokio::fs::write(&path, "foo\nbar\n").await.unwrap();
+        let p = path.to_str().unwrap();
+        let args = json!({
+            "path": p,
+            "edits": [{ "oldText": "foo", "newText": "baz" }]
+        });
+        let detail = describe_detail("edit", &args).await;
+        assert!(
+            detail.starts_with(format!("编辑文件：`{p}`（1 处改动，+1/-1 行）").as_str()),
+            "detail: {detail}"
+        );
+        assert!(detail.contains("[1] foo → baz"), "detail: {detail}");
+
+        // 文件不存在：退化为只展示路径和编辑条数
+        let args = json!({
+            "path": "/nonexistent/never.txt",
+            "edits": [{ "oldText": "a", "newText": "b" }]
+        });
+        assert_eq!(
+            describe_detail("edit", &args).await,
+            "编辑文件：`/nonexistent/never.txt`（1 处改动）"
+        );
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[test]
+    fn describe_target_matches_card_wording() {
+        assert_eq!(
+            describe_target("bash", &json!({ "command": "ls" })),
+            "执行命令 `ls`"
+        );
+        assert_eq!(
+            describe_target("edit", &json!({ "path": "/a" })),
+            "编辑文件 `/a`"
+        );
+        assert_eq!(describe_target("bash", &Value::Null), "这次 bash 调用");
+        assert_eq!(describe_target("mystery", &Value::Null), "调用工具 mystery");
     }
 
     #[test]

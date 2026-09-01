@@ -6,12 +6,10 @@ use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use crate::approval::request_approval;
-
 use super::{ToolCtx, ToolErr, human_size, record_tool_result};
 
-/// read 默认最多读取的行数
-const DEFAULT_READ_LIMIT: usize = 2000;
+/// read 默认最多读取的行数（审批卡片的 detail 渲染也会用到）
+pub(crate) const DEFAULT_READ_LIMIT: usize = 2000;
 /// read 输出字节上限（与行数上限取先到者）
 const MAX_READ_BYTES: usize = 50 * 1024;
 
@@ -84,30 +82,6 @@ impl Tool for Read {
             .await
             .map_err(|e| ToolErr(format!("读取文件 `{}` 失败：{e}", args.path)))?;
 
-        // 先确认文件存在再请审批，避免审批通过后才发现读不到
-        let approved = request_approval(
-            &ctx.bot,
-            ctx.chat_id,
-            &ctx.approvals,
-            ctx.approval_timeout,
-            "read",
-            &format!(
-                "读取文件：`{}`（offset={}，limit={limit}）",
-                args.path,
-                args.offset.unwrap_or(1),
-                limit = args.limit.filter(|l| *l > 0).unwrap_or(DEFAULT_READ_LIMIT),
-            ),
-        )
-        .await
-        .map_err(ToolErr)?;
-
-        if !approved {
-            tracing::info!("read 被用户拒绝：{}", args.path);
-            return Ok(format!(
-                "用户拒绝了读取文件 `{}`，立即停止尝试并追问用户原因。",
-                args.path
-            ));
-        }
         tracing::info!("read 开始读取：{}", args.path);
 
         // 先检查文件可读性

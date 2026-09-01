@@ -3,8 +3,6 @@
 use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 
-use crate::approval::request_approval;
-
 use super::{ToolCtx, ToolErr, record_tool_result};
 
 #[derive(Debug, Deserialize)]
@@ -52,25 +50,6 @@ impl Tool for Bash {
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
         let ctx = &self.0;
-        let approved = request_approval(
-            &ctx.bot,
-            ctx.chat_id,
-            &ctx.approvals,
-            ctx.approval_timeout,
-            "bash",
-            &format!("执行命令：`{}`", args.command),
-        )
-        .await
-        .map_err(ToolErr)?;
-
-        if !approved {
-            tracing::info!("bash 被用户拒绝：{}", args.command);
-            return Ok(format!(
-                "用户拒绝了执行命令 `{}`，立即停止尝试并追问用户原因。",
-                args.command
-            ));
-        }
-
         tracing::info!("bash 开始执行：{}", args.command);
 
         let future = tokio::process::Command::new("bash")

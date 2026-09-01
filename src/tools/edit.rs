@@ -8,10 +8,9 @@ use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 use serde::de::Deserializer;
 
-use crate::approval::request_approval;
 use crate::tools::edit_algo::{self, Edit as EditData};
 
-use super::{ToolCtx, ToolErr, preview, record_tool_result};
+use super::{ToolCtx, ToolErr, record_tool_result};
 
 /// 一条编辑：oldText 必须是原文件中唯一的文本块
 #[derive(Debug, Clone, Deserialize)]
@@ -138,7 +137,7 @@ impl Tool for Edit {
             ));
         }
 
-        // 先读文件算好 diff，再请用户审批（审批卡片里能直接看到改动内容）
+        // 先读文件并应用编辑（审批卡片里的 diff/预览由 ApprovalHook 另行计算）
         let raw = tokio::fs::read_to_string(&args.path)
             .await
             .map_err(|e| ToolErr(format!("Could not read file `{}`: {e}", args.path)))?;
@@ -157,43 +156,6 @@ impl Tool for Edit {
             })
             .collect();
         let applied = edit_algo::apply_edits(&normalized, &data, &args.path).map_err(ToolErr)?;
-        let (diff, _) = edit_algo::generate_diff_string(&applied.base, &applied.new);
-
-        // 摘要：改动行数从 diff 文本统计（+N/-N 前缀行）
-        let added = diff.lines().filter(|l| l.starts_with('+')).count();
-        let removed = diff.lines().filter(|l| l.starts_with('-')).count();
-        let mut lines = vec![format!(
-            "编辑文件：`{}`（{} 处改动，+{added}/-{removed} 行）",
-            args.path,
-            args.edits.len()
-        )];
-        for (i, e) in args.edits.iter().enumerate() {
-            lines.push(format!(
-                "[{}] {} → {}",
-                i + 1,
-                preview(&e.old_text, 100),
-                preview(&e.new_text, 100)
-            ));
-        }
-
-        let approved = request_approval(
-            &ctx.bot,
-            ctx.chat_id,
-            &ctx.approvals,
-            ctx.approval_timeout,
-            "edit",
-            &lines.join("\n"),
-        )
-        .await
-        .map_err(ToolErr)?;
-
-        if !approved {
-            tracing::info!("edit 被用户拒绝：{}", args.path);
-            return Ok(format!(
-                "用户拒绝了编辑文件 `{}`，立即停止尝试并追问用户原因。",
-                args.path
-            ));
-        }
 
         tracing::info!("edit 写入：{}（{} 条编辑）", args.path, args.edits.len());
         // 还原原文件的换行风格后落盘

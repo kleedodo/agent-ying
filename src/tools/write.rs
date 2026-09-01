@@ -5,9 +5,7 @@ use std::path::Path;
 use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 
-use crate::approval::request_approval;
-
-use super::{ToolCtx, ToolErr, human_size, preview, record_tool_result};
+use super::{ToolCtx, ToolErr, record_tool_result};
 
 #[derive(Debug, Deserialize)]
 pub struct WriteArgs {
@@ -65,30 +63,6 @@ impl Tool for Write {
                 "路径 `{}` 不是绝对路径（只接受绝对路径）",
                 args.path
             )));
-        }
-
-        let approved = request_approval(
-            &ctx.bot,
-            ctx.chat_id,
-            &ctx.approvals,
-            ctx.approval_timeout,
-            "write",
-            &format!(
-                "写文件：`{}`（{} 字节）\n{}",
-                args.path,
-                human_size(args.content.len() as u64),
-                preview(&args.content, 100),
-            ),
-        )
-        .await
-        .map_err(ToolErr)?;
-
-        if !approved {
-            tracing::info!("write 被用户拒绝：{}", args.path);
-            return Ok(format!(
-                "用户拒绝了写文件 `{}`，立即停止尝试并追问用户原因。",
-                args.path
-            ));
         }
 
         tracing::info!("write 开始写入：{}", args.path);

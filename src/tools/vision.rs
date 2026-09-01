@@ -13,10 +13,9 @@ use rig::providers::openai;
 use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
 
-use crate::approval::request_approval;
 use crate::image::compress_image;
 
-use super::{ToolCtx, ToolErr, human_size, record_tool_result};
+use super::{ToolCtx, ToolErr, record_tool_result};
 
 #[derive(Debug, Deserialize)]
 pub struct VisionArgs {
@@ -104,30 +103,12 @@ impl Tool for Vision {
         }
 
         // 先检查文件存在性和大小，避免审批通过后才发现读不到
+        // 先检查文件存在性和大小，避免审批通过后才发现读不到
         let metadata = tokio::fs::metadata(&args.path)
             .await
             .map_err(|e| ToolErr(format!("读取图片 `{}` 失败：{e}", args.path)))?;
         if !metadata.is_file() {
             return Err(ToolErr(format!("`{}` 不是普通文件", args.path)));
-        }
-
-        let approved = request_approval(
-            &ctx.bot,
-            ctx.chat_id,
-            &ctx.approvals,
-            ctx.approval_timeout,
-            "vision",
-            &format!("看图：`{}`（{}）", args.path, human_size(metadata.len())),
-        )
-        .await
-        .map_err(ToolErr)?;
-
-        if !approved {
-            tracing::info!("vision 被用户拒绝：{}", args.path);
-            return Ok(format!(
-                "用户拒绝了看图 `{}`，停止尝试并追问用户。",
-                args.path
-            ));
         }
         tracing::info!("vision 开始看图：{}", args.path);
 

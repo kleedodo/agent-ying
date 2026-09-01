@@ -1,6 +1,6 @@
 //! 工具模块：每个工具一个子文件（bash/read/vision/write/edit），
 //! 共享的上下文、错误类型、结果落盘逻辑和通用小工具放在这里。
-//! 每个工具执行前都会先通过 Telegram 内联按钮请用户明确同意。
+//! 工具执行前的审批统一由 [crate::approval::ApprovalHook] 通过 Telegram 内联按钮完成。
 
 pub mod bash;
 pub mod edit;
@@ -17,11 +17,8 @@ pub use write::Write;
 
 use std::path::Path;
 
-use teloxide::prelude::*;
 use thiserror::Error;
 use uuid::Uuid;
-
-use crate::approval::ApprovalManager;
 
 /// 工具输出超过该字符数时返回头尾摘要（全文始终落盘）
 /// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给摘要让模型按需取
@@ -91,14 +88,11 @@ pub async fn record_tool_result(dir: &Path, s: &str) -> Result<String, ToolErr> 
     ))
 }
 
-/// 各工具共用的字段：目标聊天 + 审批管理器 + 用户发来文件的缓存。
+/// 各工具共用的字段：bash 超时 + 输出落盘目录。
+/// 审批（bot/chat/审批管理器）已上移到 [crate::approval::ApprovalHook]，工具不再感知。
 #[derive(Clone)]
 pub struct ToolCtx {
-    pub bot: Bot,
-    pub chat_id: ChatId,
-    pub approvals: ApprovalManager,
     pub bash_timeout: std::time::Duration,
-    pub approval_timeout: std::time::Duration,
     /// 当前会话的 toolout/ 目录，所有工具结果的全文都落盘到这里
     pub toolout_dir: std::path::PathBuf,
 }

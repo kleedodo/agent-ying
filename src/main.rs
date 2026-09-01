@@ -19,7 +19,7 @@ use teloxide::prelude::*;
 use teloxide::types::{BotCommand, ChatId, UpdateKind, UserId};
 use tokio::sync::Mutex;
 
-use approval::ApprovalManager;
+use approval::{ApprovalHook, ApprovalManager};
 use config::Config;
 use handlers::{on_callback, on_message, on_unmatched};
 use journal::Journal;
@@ -73,11 +73,7 @@ impl AppState {
 impl AppState {
     fn agent_for(&self, chat_id: ChatId, toolout_dir: std::path::PathBuf) -> YingAgent {
         let ctx = ToolCtx {
-            bot: self.bot.clone(),
-            chat_id,
-            approvals: self.approvals.clone(),
             bash_timeout: self.bash_timeout,
-            approval_timeout: self.approval_timeout,
             toolout_dir,
         };
         let mut builder = self
@@ -98,6 +94,14 @@ impl AppState {
                 ctx: ctx.clone(),
             });
         }
+        // 审批钩子：每个工具体执行前统一发 Telegram 审批按钮，
+        // 同意才执行，拒绝/超时以 Skip 理由喂回模型
+        builder = builder.add_hook(ApprovalHook::new(
+            self.bot.clone(),
+            chat_id,
+            self.approvals.clone(),
+            self.approval_timeout,
+        ));
         // 采样参数与最大轮数都从配置读取
         builder
             .temperature(self.temperature)
