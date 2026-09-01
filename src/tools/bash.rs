@@ -30,7 +30,7 @@ impl Tool for Bash {
     type Output = String;
 
     fn description(&self) -> String {
-        "在 shell 中执行一条 bash 命令，返回 stdout 和 stderr".into()
+        "在 shell 中执行一条 bash 命令，返回退出码、stdout 和 stderr".into()
     }
 
     fn parameters(&self) -> serde_json::Value {

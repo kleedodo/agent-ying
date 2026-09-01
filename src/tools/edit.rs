@@ -86,7 +86,7 @@ impl Tool for Edit {
     type Output = String;
 
     fn description(&self) -> String {
-        "对单个文件做精确文本替换：每条 edits[].oldText 必须原样唯一命中、且彼此不重叠，全部编辑对着同一份原始文件匹配（非增量）。同一处或相邻行有多处改动时合并成一条编辑，不要发重叠/嵌套编辑。oldText 尽量小而唯一，不要为衔接远处的改动带大段不变内容。同一文件改多处时，用一次 edit 调用的 edits[] 带多条，而不是多次调用".into()
+        "对单个文件做精确文本替换；同一文件改多处时，用一次 edit 调用的 edits[] 带多条，而不是多次调用".into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -99,13 +99,13 @@ impl Tool for Edit {
                 },
                 "edits": {
                     "type": "array",
-                    "description": "一组精确替换。每条编辑都对着原始文件匹配（非增量）。不要包含重叠或嵌套的编辑；同一块或相邻行有多处改动时合并成一条编辑",
+                    "description": "一组精确替换，每条编辑都对着同一份原始文件匹配（非增量），不要包含重叠或嵌套的编辑；同一处或相邻行有多处改动时合并成一条编辑",
                     "items": {
                         "type": "object",
                         "properties": {
                             "oldText": {
                                 "type": "string",
-                                "description": "要精确替换的原文，必须在原文件中唯一，且不与本次调用的其他 edits[].oldText 重叠"
+                                "description": "要精确替换的原文，必须在原文件中唯一，且不与本次调用的其他 edits[].oldText 重叠。尽量小而唯一，不要为衔接远处的改动带大段不变内容"
                             },
                             "newText": {
                                 "type": "string",

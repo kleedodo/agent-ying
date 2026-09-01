@@ -43,11 +43,8 @@ impl Tool for Read {
     type Output = String;
 
     fn description(&self) -> String {
-        format!(
-            "读取一个文本文件（如 SKILL.md 或其他任意文件），返回原始内容（不带行号前缀）；\
-             默认最多读 {} 行或 50KB（先到者为准），截断时会附提示",
-            DEFAULT_READ_LIMIT
-        )
+        "读取一个文本文件，返回原始内容（不带行号前缀）；输出被截断时会附提示，说明如何继续读取"
+            .into()
     }
 
     fn parameters(&self) -> serde_json::Value {
