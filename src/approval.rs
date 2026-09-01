@@ -401,7 +401,9 @@ impl AgentHook for ApprovalHook {
             Ok(false) => {
                 let target = describe_target(event.tool_name, &args);
                 tracing::info!("{target} 被用户拒绝");
-                ToolCallAction::skip(format!("用户拒绝了{target}，立即停止尝试并追问用户原因。"))
+                ToolCallAction::skip(format!(
+                    "用户明确拒绝了本次调用：{target}。这不是工具报错——不要重试同一操作或换参数再试，直接回复用户并询问拒绝原因。"
+                ))
             }
             Err(e) => {
                 tracing::error!("审批请求发送失败： {e}");
