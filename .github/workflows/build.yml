@@ -1,0 +1,125 @@
+name: Build
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Git tag to upload release assets to'
+        required: true
+        type: string
+        default: ''
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # --- Linux (Debian/glibc) --- x86_64 + arm64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: agent-kim-linux-x86_64
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            artifact: agent-kim-linux-aarch64
+
+          # --- macOS (native Apple Silicon arm64) ---
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact: agent-kim-macos-aarch64
+
+          # --- Windows (native x86_64) ---
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: agent-kim-windows-x86_64.exe
+
+          # --- FreeBSD (cross-compile via zig) ---
+          - os: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            artifact: agent-kim-freebsd-x86_64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # --- Linux aarch64: need cross-compiler ---
+      - name: Install aarch64 Linux cross compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+      # --- Install cargo-zigbuild for FreeBSD cross-compilation ---
+      - name: Install cargo-zigbuild
+        if: matrix.target == 'x86_64-unknown-freebsd'
+        run: pip3 install ziglang cargo-zigbuild
+      # --- Build ---
+      - name: Build release
+        shell: bash
+        run: |
+          if [ "${{ matrix.target }}" = "x86_64-unknown-freebsd" ]; then
+            cargo zigbuild --release --target ${{ matrix.target }}
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      # --- Strip debug symbols (Unix only) ---
+      - name: Strip binary
+        if: matrix.os != 'windows-latest'
+        shell: bash
+        run: |
+          STRIP="strip"
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            STRIP="aarch64-linux-gnu-strip"
+          fi
+          $STRIP target/${{ matrix.target }}/release/agent-kim 2>/dev/null || true
+
+      # --- Package ---
+      - name: Package artifact
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/agent-kim"
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            BIN="${BIN}.exe"
+          fi
+          mkdir -p dist
+          cp "$BIN" "dist/${{ matrix.artifact }}"
+          tar czf "dist/${{ matrix.artifact }}.tar.gz" -C dist "${{ matrix.artifact }}"
+
+      # --- Upload to GitHub Artifacts ---
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish Release
+    needs: build
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.event.inputs.tag }}
+          files: dist/**/*.tar.gz
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
