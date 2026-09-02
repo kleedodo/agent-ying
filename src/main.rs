@@ -44,6 +44,8 @@ struct AppState {
     journal: Journal,
     /// 每个 chat 当前会话的 journal 文件；/new 后重新创建
     sessions: Arc<Mutex<HashMap<ChatId, journal::SessionFile>>>,
+    /// 未授权用户回复节流：UserId → (窗口内首次回复时间, 窗口内已回复次数)
+    unauth_replies: Arc<Mutex<HashMap<UserId, (tokio::time::Instant, u32)>>>,
     name: String,
     model: String,
     /// 是否把用户发来的图片转发给 vision 工具；true 且 vision 已启用时，图片存会话 media/ 目录并转发
@@ -232,6 +234,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         histories: Arc::new(Mutex::new(HashMap::new())),
         journal: Journal::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
+        unauth_replies: Arc::new(Mutex::new(HashMap::new())),
         name: config.name,
         model: config.model,
         forward_to_vision: config.forward_to_vision,

@@ -7,8 +7,10 @@ use rig::agent::StreamingError;
 use rig::completion::Message as RigMessage;
 use rig::prelude::{MultiTurnStreamItem, StreamingChat};
 use rig::streaming::StreamedAssistantContent;
+use std::collections::HashMap;
 use teloxide::prelude::*;
-use teloxide::types::{ChatAction, ChatId, InlineKeyboardMarkup, MessageId};
+
+use teloxide::types::{ChatAction, ChatId, InlineKeyboardMarkup, MessageId, UserId};
 use tokio::time::Instant;
 use uuid::Uuid;
 
@@ -25,17 +27,28 @@ pub type HandlerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
 pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     // 只响应配置里允许的用户
     let Some(from) = msg.from.as_ref() else {
-        state
-            .bot
-            .send_message(msg.chat.id, "🚫 无法识别发送者，请私聊我。")
-            .await?;
+        tracing::warn!("无法识别消息发送者（无 from 字段）: chat={}", msg.chat.id);
         return Ok(());
     };
     if !state.allows_user(from.id) {
-        state
-            .bot
-            .send_message(msg.chat.id, "🚫 未授权用户，请找 bot 主人加白名单。")
-            .await?;
+        // 未授权用户：直接回复其 from.id；每人每 30 分钟最多回 3 次
+        let allowed = {
+            let mut map = state.unauth_replies.lock().await;
+            allow_unauth_reply(&mut map, from.id)
+        };
+        if allowed {
+            tracing::info!("未授权用户 {:?}，回复其 from.id", from.id);
+            state
+                .bot
+                .send_message(msg.chat.id, from.id.0.to_string())
+                .await?;
+        } else {
+            tracing::info!(
+                "未授权用户 {:?}，半小时内已回复 {} 次，不再回复",
+                from.id,
+                UNAUTH_MAX_PER_WINDOW
+            );
+        }
         return Ok(());
     }
 
@@ -215,6 +228,45 @@ async fn handle_command(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// 未授权用户回复节流窗口：30 分钟
+const UNAUTH_WINDOW: Duration = Duration::from_secs(30 * 60);
+/// 每个未授权 from.id 在窗口内最多回复次数
+const UNAUTH_MAX_PER_WINDOW: u32 = 3;
+/// 最多记录多少个不同的未授权 from.id
+const UNAUTH_MAX_ENTRIES: usize = 128;
+
+/// 记一次未授权用户回复；返回本次是否允许回复（每个 from.id 每 30 分钟最多 3 次）。
+/// map 元素为 (窗口内首次回复时间, 窗口内已回复次数)。
+/// 懒重置：已有条目超过窗口则重新计数；
+/// 懒清理：新增前删除已过期条目，仍超过 128 个则淘汰最旧的。
+fn allow_unauth_reply(map: &mut HashMap<UserId, (Instant, u32)>, user_id: UserId) -> bool {
+    let now = Instant::now();
+    if let Some((first, count)) = map.get_mut(&user_id) {
+        if now.duration_since(*first) >= UNAUTH_WINDOW {
+            *first = now;
+            *count = 1;
+            return true;
+        }
+        if *count >= UNAUTH_MAX_PER_WINDOW {
+            return false;
+        }
+        *count += 1;
+        return true;
+    }
+    // 新增前懒清理：先删过期条目，仍满则淘汰最旧的一个
+    if map.len() >= UNAUTH_MAX_ENTRIES {
+        map.retain(|_, (first, _)| now.duration_since(*first) < UNAUTH_WINDOW);
+        if map.len() >= UNAUTH_MAX_ENTRIES {
+            let oldest = map.iter().min_by_key(|(_, (t, _))| *t).map(|(id, _)| *id);
+            if let Some(id) = oldest {
+                map.remove(&id);
+            }
+        }
+    }
+    map.insert(user_id, (now, 1));
+    true
 }
 
 /// 非文本消息的日志文案：优先 caption，没有则打 [XX消息] 占位
@@ -579,6 +631,49 @@ mod tests {
                 Duration::from_millis(200)
             );
         }
+    }
+
+    #[test]
+    fn unauth_reply_allows_three_then_blocks() {
+        let mut map = HashMap::new();
+        let id = UserId(42);
+        assert!(allow_unauth_reply(&mut map, id));
+        assert!(allow_unauth_reply(&mut map, id));
+        assert!(allow_unauth_reply(&mut map, id));
+        assert!(!allow_unauth_reply(&mut map, id));
+    }
+
+    #[test]
+    fn unauth_reply_lazily_resets_after_window() {
+        let mut map = HashMap::new();
+        let id = UserId(42);
+        for _ in 0..3 {
+            assert!(allow_unauth_reply(&mut map, id));
+        }
+        // 窗口过期：懒重置，重新允许回复
+        map.insert(
+            id,
+            (Instant::now() - UNAUTH_WINDOW - Duration::from_secs(1), 3),
+        );
+        assert!(allow_unauth_reply(&mut map, id));
+        assert_eq!(map[&id].1, 1);
+    }
+
+    #[test]
+    fn unauth_reply_evicts_oldest_beyond_limit() {
+        let mut map = HashMap::new();
+        // 填满 128 个（时间各不相同，方便淘汰最旧）
+        for i in 0..UNAUTH_MAX_ENTRIES as i64 {
+            let id = UserId(i.try_into().unwrap());
+            assert!(allow_unauth_reply(&mut map, id));
+            map.insert(id, (Instant::now() - Duration::from_secs(i as u64), 1));
+        }
+        // 新增一个：最旧的（UserId(127)，时间最旧）被淘汰
+        let new_id = UserId(999_999);
+        assert!(allow_unauth_reply(&mut map, new_id));
+        assert_eq!(map.len(), UNAUTH_MAX_ENTRIES);
+        assert!(map.contains_key(&new_id));
+        assert!(!map.contains_key(&UserId(127)));
     }
 
     #[test]
