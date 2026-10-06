@@ -1,7 +1,9 @@
 //! 审批管理：工具执行前，agent 在 Telegram 里发审批请求并等用户点击按钮。
-//! 一轮（从首次请求审批到最终回复完毕）的所有审批记录合并到同一条「审批日志」消息：
+//! 一轮（从首次请求审批到最终回复完毕）的审批记录合并到同一条「审批日志」消息：
 //! 已决定的条目内联展示，最新待审批条目带「同意 / 拒绝」按钮，
 //! 本轮结束时追加「🏁 本轮结束」尾注。
+//! 记录内容全量渲染；追加新记录会超出单条消息上限时，冻结当前消息并另起一条继续记录；
+//! 单条记录本身就超限时按约 4000 字符分块、逐块发消息，用户始终能看到完整内容。
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -19,11 +21,8 @@ use crate::tools::edit_algo::{self, Edit as EditData};
 use crate::tools::read::DEFAULT_READ_LIMIT;
 use crate::tools::{human_size, preview};
 
-/// Telegram 单条消息上限 4096 字符，留点余量
-const MAX_LOG_LEN: usize = 3800;
-
-/// 单条记录的 detail 最长字符数，防止一条巨长命令撑爆日志消息
-const MAX_DETAIL_LEN: usize = 1500;
+/// Telegram 单条消息上限 4096 字符
+const MAX_MSG_LEN: usize = 4096;
 
 /// 单条审批记录的决定结果
 #[derive(Clone, Copy)]
@@ -45,6 +44,7 @@ fn decision_label(d: Decision) -> &'static str {
 }
 
 /// 一条审批记录
+#[derive(Clone)]
 struct Entry {
     tool: String,
     detail: String,
@@ -73,44 +73,11 @@ impl ChatLog {
 }
 
 /// 渲染日志文本与当前按钮对应的审批 id（无待审批项时为 None）。
-/// 超长时先省略较旧记录的详情，仍超长则丢弃最早的记录。
+/// 每条记录的详情全量渲染；长度控制由 `request_approval` 负责（超限时冻结当前消息、另起一条）。
 fn render_log(entries: &[Entry], finished: bool) -> (String, Option<String>) {
-    let full = render_once(entries, finished, false, 0);
-    if full.0.chars().count() <= MAX_LOG_LEN {
-        return full;
-    }
-    let compact = render_once(entries, finished, true, 0);
-    if compact.0.chars().count() <= MAX_LOG_LEN {
-        return compact;
-    }
-    let mut drop = 1;
-    while drop < entries.len() {
-        let rendered = render_once(entries, finished, true, drop);
-        if rendered.0.chars().count() <= MAX_LOG_LEN {
-            return rendered;
-        }
-        drop += 1;
-    }
-    render_once(entries, finished, true, entries.len().saturating_sub(1))
-}
-
-/// 单趟渲染：`compact_old` 时旧记录的详情被省略，`drop_oldest > 0` 时丢弃最早的记录。
-fn render_once(
-    entries: &[Entry],
-    finished: bool,
-    compact_old: bool,
-    drop_oldest: usize,
-) -> (String, Option<String>) {
     let mut pending: Option<String> = None;
-    let mut lines: Vec<String> = Vec::new();
-    if drop_oldest > 0 {
-        lines.push(format!("… 省略了 {drop_oldest} 条早期记录"));
-    }
-    lines.push("🔧 审批日志".to_string());
-    lines.push(String::new());
-    // 最近两条始终保留完整详情
-    let keep_full_from = entries.len().saturating_sub(2);
-    for (i, e) in entries.iter().enumerate().skip(drop_oldest) {
+    let mut lines: Vec<String> = vec!["🔧 审批日志".to_string(), String::new()];
+    for (i, e) in entries.iter().enumerate() {
         if let Some(id) = &e.pending_id {
             pending = Some(id.clone());
         }
@@ -120,8 +87,7 @@ fn render_once(
             (None, None) => "❓",
         };
         let head = format!("{}. {status} `{}`", i + 1, e.tool);
-        let compact = compact_old && i < keep_full_from;
-        if compact || e.detail.trim().is_empty() {
+        if e.detail.trim().is_empty() {
             lines.push(head);
         } else {
             let detail = e.detail.replace('\n', "\n   ");
@@ -137,6 +103,54 @@ fn render_once(
         lines.push(format!("🏁 本轮结束，共 {} 次审批", entries.len()));
     }
     (lines.join("\n"), pending)
+}
+
+/// 渲染 detail 时换行会被缩进（多 3 字符），按这个口径计算实际长度
+fn effective_len(s: &str) -> usize {
+    s.chars().map(|c| usize::from(c == '\n') + 1).sum()
+}
+
+/// 单条日志消息能容纳的 detail 长度（≈ 4000）：
+/// 用 1 字符占位量出固定开销（标题、状态行、缩进前缀、「是否放行？」），再用 4096 减掉
+fn detail_budget(tool: &str) -> usize {
+    let overhead = render_log(
+        &[Entry {
+            tool: tool.to_string(),
+            detail: "x".to_string(),
+            pending_id: Some(String::new()),
+            decision: None,
+        }],
+        false,
+    )
+    .0
+    .chars()
+    .count()
+        - 1;
+    MAX_MSG_LEN.saturating_sub(overhead)
+}
+
+/// 把记录的 detail 按「单条消息能装下」的长度分块，内容一个字符不丢。
+/// 单块时直接返回原样；多块时前几块作为续发消息，最后一块进日志消息带审批按钮。
+fn split_detail(detail: &str, budget: usize) -> Vec<String> {
+    if effective_len(detail) <= budget {
+        return vec![detail.to_string()];
+    }
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    let mut used = 0usize;
+    for c in detail.chars() {
+        let w = usize::from(c == '\n') + 1;
+        if used + w > budget {
+            chunks.push(std::mem::take(&mut cur));
+            used = 0;
+        }
+        cur.push(c);
+        used += w;
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
 }
 
 /// 按钮键盘：有待审批项则带「同意 / 拒绝」，空键盘 = 摘掉按钮
@@ -269,7 +283,7 @@ pub async fn request_approval(
         detail
     );
 
-    // 追加新的待审批记录并发出/更新日志消息。
+    // 追加新的待审批记录并发出/更新日志消息（追加后超 4096 则冻结旧消息、另起一条）。
     // 若还有未决定的旧记录（并行工具调用），按「被取代」处理并自动拒绝，免得 agent 卡住等超时
     {
         let mut logs = approvals.logs.lock().await;
@@ -289,13 +303,60 @@ pub async fn request_approval(
                 }
             }
         }
-        let detail: String = detail.chars().take(MAX_DETAIL_LEN).collect();
-        log.entries.push(Entry {
+        // 按「单条消息能装下」的长度分块（≈ 4000 字符/块）；
+        // 多块记录独占一组消息：前几块作为续发消息，最后一块进日志消息带审批按钮
+        let chunks = split_detail(detail, detail_budget(tool));
+        let probe = Entry {
             tool: tool.to_string(),
-            detail,
+            detail: chunks.last().cloned().unwrap_or_default(),
             pending_id: Some(id.clone()),
             decision: None,
-        });
+        };
+        let needs_new_message = chunks.len() > 1
+            || (log.message_id.0 != 0 && !log.entries.is_empty() && {
+                let combined: Vec<Entry> = log
+                    .entries
+                    .iter()
+                    .cloned()
+                    .chain(std::iter::once(probe.clone()))
+                    .collect();
+                render_log(&combined, false).0.chars().count() > MAX_MSG_LEN
+            });
+        if needs_new_message {
+            // 冻结当前消息：此刻旧记录已全部决定（待审批的已按「被取代」拒绝），摘掉按钮即可
+            if log.message_id.0 != 0 && !log.entries.is_empty() {
+                let (frozen_text, _) = render_log(&log.entries, false);
+                if let Err(e) = bot
+                    .edit_message_text(chat_id, log.message_id, frozen_text)
+                    .reply_markup(keyboard_for(None))
+                    .await
+                {
+                    tracing::warn!("编辑被冻结的审批日志消息失败： {e}");
+                }
+            }
+            log.entries.clear();
+            log.message_id = MessageId(0);
+            // 续发前面的分块，把完整内容展示给用户
+            let total = chunks.len();
+            for (i, chunk) in chunks[..total - 1].iter().enumerate() {
+                let text = format!(
+                    "🔧 审批日志（第 {}/{} 段）\n\n{}",
+                    i + 1,
+                    total,
+                    chunk.replace('\n', "\n   ")
+                );
+                if let Err(e) = bot.send_message(chat_id, text).await {
+                    return Err(e.to_string());
+                }
+            }
+        }
+        let entry = Entry {
+            tool: tool.to_string(),
+            detail: chunks.last().cloned().unwrap_or_default(),
+            pending_id: Some(id.clone()),
+            decision: None,
+        };
+        log.entries.push(entry);
         let (text, _) = render_log(&log.entries, log.finished);
         let kb = keyboard_for(Some(&id));
         let sent = if log.message_id.0 == 0 {
@@ -700,18 +761,44 @@ mod tests {
     }
 
     #[test]
-    fn render_truncates_when_too_long() {
-        let entries: Vec<Entry> = (0..200)
-            .map(|i| decided("bash", &format!("cmd-{i}\n{}", "x".repeat(500))))
-            .collect();
+    fn render_keeps_full_details() {
+        // 记录内容全量渲染，不再省略或丢弃
+        let entries = vec![decided("bash", &format!("cmd-0\n{}", "x".repeat(5000)))];
         let (text, pending) = render_log(&entries, false);
         assert!(pending.is_none());
-        assert!(
-            text.chars().count() <= MAX_LOG_LEN,
-            "渲染结果 {} 字，超出上限",
-            text.chars().count()
-        );
-        // 最近一条始终保留完整详情
-        assert!(text.contains("cmd-199"));
+        assert!(text.contains("cmd-0"));
+        assert!(text.contains(&"x".repeat(5000)));
+    }
+
+    #[test]
+    fn split_detail_chunks_huge_records_without_losing_content() {
+        let budget = detail_budget("bash");
+        // 预算应接近 4000 且小于单条消息上限
+        assert!((3800..MAX_MSG_LEN).contains(&budget), "budget={budget}");
+
+        // 未超限时不分块、原样保留
+        let small = "ls -la";
+        assert_eq!(split_detail(small, budget), vec![small.to_string()]);
+
+        // 单条记录超出 4096 时按预算分块，内容一个字符不丢，
+        // 且每块渲染出的消息都能完整发出去
+        let huge: String = "x".repeat(budget * 3 + 100);
+        let chunks = split_detail(&huge, budget);
+        assert!(chunks.len() >= 3, "chunks={}", chunks.len());
+        assert_eq!(chunks.join(""), huge);
+        for chunk in &chunks {
+            let entry = Entry {
+                tool: "bash".into(),
+                detail: chunk.clone(),
+                pending_id: Some("1".into()),
+                decision: None,
+            };
+            let (text, _) = render_log(&[entry], false);
+            assert!(
+                text.chars().count() <= MAX_MSG_LEN,
+                "块渲染结果 {} 字，超出上限",
+                text.chars().count()
+            );
+        }
     }
 }
