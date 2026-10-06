@@ -75,67 +75,68 @@ impl ChatLog {
 /// 渲染日志文本与当前按钮对应的审批 id（无待审批项时为 None）。
 /// 超长时先省略较旧记录的详情，仍超长则丢弃最早的记录。
 fn render_log(entries: &[Entry], finished: bool) -> (String, Option<String>) {
-    fn render(
-        entries: &[Entry],
-        finished: bool,
-        compact_old: bool,
-        drop_oldest: usize,
-    ) -> (String, Option<String>) {
-        let mut pending: Option<String> = None;
-        let mut lines: Vec<String> = Vec::new();
-        if drop_oldest > 0 {
-            lines.push(format!("… 省略了 {drop_oldest} 条早期记录"));
-        }
-        lines.push("🔧 审批日志".to_string());
-        lines.push(String::new());
-        // 最近两条始终保留完整详情
-        let keep_full_from = entries.len().saturating_sub(2);
-        for (i, e) in entries.iter().enumerate().skip(drop_oldest) {
-            if let Some(id) = &e.pending_id {
-                pending = Some(id.clone());
-            }
-            let status = match (&e.pending_id, e.decision) {
-                (Some(_), _) => "🔧 待审批",
-                (None, Some(d)) => decision_label(d),
-                (None, None) => "❓",
-            };
-            let head = format!("{}. {status} `{}`", i + 1, e.tool);
-            let compact = compact_old && i < keep_full_from;
-            if compact || e.detail.trim().is_empty() {
-                lines.push(head);
-            } else {
-                let detail = e.detail.replace('\n', "\n   ");
-                lines.push(format!("{head}\n   {detail}"));
-            }
-        }
-        if pending.is_some() {
-            lines.push(String::new());
-            lines.push("是否放行？".to_string());
-        }
-        if finished {
-            lines.push(String::new());
-            lines.push(format!("🏁 本轮结束，共 {} 次审批", entries.len()));
-        }
-        (lines.join("\n"), pending)
-    }
-
-    let full = render(entries, finished, false, 0);
+    let full = render_once(entries, finished, false, 0);
     if full.0.chars().count() <= MAX_LOG_LEN {
         return full;
     }
-    let compact = render(entries, finished, true, 0);
+    let compact = render_once(entries, finished, true, 0);
     if compact.0.chars().count() <= MAX_LOG_LEN {
         return compact;
     }
     let mut drop = 1;
     while drop < entries.len() {
-        let (text, pending) = render(entries, finished, true, drop);
-        if text.chars().count() <= MAX_LOG_LEN {
-            return (text, pending);
+        let rendered = render_once(entries, finished, true, drop);
+        if rendered.0.chars().count() <= MAX_LOG_LEN {
+            return rendered;
         }
         drop += 1;
     }
-    render(entries, finished, true, entries.len().saturating_sub(1))
+    render_once(entries, finished, true, entries.len().saturating_sub(1))
+}
+
+/// 单趟渲染：`compact_old` 时旧记录的详情被省略，`drop_oldest > 0` 时丢弃最早的记录。
+fn render_once(
+    entries: &[Entry],
+    finished: bool,
+    compact_old: bool,
+    drop_oldest: usize,
+) -> (String, Option<String>) {
+    let mut pending: Option<String> = None;
+    let mut lines: Vec<String> = Vec::new();
+    if drop_oldest > 0 {
+        lines.push(format!("… 省略了 {drop_oldest} 条早期记录"));
+    }
+    lines.push("🔧 审批日志".to_string());
+    lines.push(String::new());
+    // 最近两条始终保留完整详情
+    let keep_full_from = entries.len().saturating_sub(2);
+    for (i, e) in entries.iter().enumerate().skip(drop_oldest) {
+        if let Some(id) = &e.pending_id {
+            pending = Some(id.clone());
+        }
+        let status = match (&e.pending_id, e.decision) {
+            (Some(_), _) => "🔧 待审批",
+            (None, Some(d)) => decision_label(d),
+            (None, None) => "❓",
+        };
+        let head = format!("{}. {status} `{}`", i + 1, e.tool);
+        let compact = compact_old && i < keep_full_from;
+        if compact || e.detail.trim().is_empty() {
+            lines.push(head);
+        } else {
+            let detail = e.detail.replace('\n', "\n   ");
+            lines.push(format!("{head}\n   {detail}"));
+        }
+    }
+    if pending.is_some() {
+        lines.push(String::new());
+        lines.push("是否放行？".to_string());
+    }
+    if finished {
+        lines.push(String::new());
+        lines.push(format!("🏁 本轮结束，共 {} 次审批", entries.len()));
+    }
+    (lines.join("\n"), pending)
 }
 
 /// 按钮键盘：有待审批项则带「同意 / 拒绝」，空键盘 = 摘掉按钮
