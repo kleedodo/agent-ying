@@ -18,6 +18,7 @@ use crate::{
     AppState,
     approval::{ResolveOutcome, approval_body},
     journal::SessionFile,
+    send::{edit_md, send_md},
     usermsg::build_user_message,
 };
 
@@ -38,10 +39,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         };
         if allowed {
             tracing::info!("未授权用户 {:?}，回复其 from.id", from.id);
-            state
-                .bot
-                .send_message(msg.chat.id, from.id.0.to_string())
-                .await?;
+            send_md(state.bot.send_message(msg.chat.id, from.id.0.to_string())).await?;
         } else {
             tracing::info!(
                 "未授权用户 {:?}，半小时内已回复 {} 次，不再回复",
@@ -90,10 +88,12 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
     let forward_to_vision = state.forward_to_vision && state.vision_client.is_some();
     let Some(user_msg) = build_user_message(&state.bot, &msg, &session, forward_to_vision).await?
     else {
-        state
-            .bot
-            .send_message(chat_id, "请发送文本、图片、文档、视频或音频 🙏")
-            .await?;
+        send_md(
+            state
+                .bot
+                .send_message(chat_id, "请发送文本、图片、文档、视频或音频 🙏"),
+        )
+        .await?;
         return Ok(());
     };
 
@@ -159,10 +159,12 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         StreamTerminal::Error(e) => {
             tracing::error!("Agent 出错： chat={} {e}", chat_id);
             collector.cleanup_empty_placeholder().await;
-            state
-                .bot
-                .send_message(chat_id, format!("⚠️ Agent 出错： {e}"))
-                .await?;
+            send_md(
+                state
+                    .bot
+                    .send_message(chat_id, format!("⚠️ Agent 出错： {e}")),
+            )
+            .await?;
             record_abnormal_round(&session, round_id, &logged_user_msg).await;
             // 本轮收尾：审批日志消息追加「🏁 本轮结束」尾注（本轮无审批则不做任何事）
             state.approvals.finish_run(&state.bot, chat_id).await;
@@ -171,10 +173,13 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
         // 流结束却没收到 FinalResponse（异常）：有预览文本就保留，否则报错
         StreamTerminal::Ended if collector.preview.trim().is_empty() => {
             collector.delete_placeholder().await;
-            state
-                .bot
-                .send_message(chat_id, "⚠️ Agent 出错： 流结束但没有最终响应")
-                .await?;
+            send_md(
+                state
+                    .bot
+                    .send_message(chat_id, "⚠️ Agent 出错： 流结束但没有最终响应"),
+            )
+            .await?;
+
             record_abnormal_round(&session, round_id, &logged_user_msg).await;
             state.approvals.finish_run(&state.bot, chat_id).await;
             return Ok(());
@@ -204,27 +209,27 @@ async fn handle_command(
     text: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     if text.starts_with("/start") || text.starts_with("/help") {
-        state
-            .bot
-            .send_message(
-                chat_id,
-                "👋 我是 ying！直接发文本或图片就行。\n\
-                 我可以用 `bash` 跑命令、`read` 读文件，\n\
-                 也能看你发的图片、看电脑上的图片（vision）。\n\
-                 每次调用工具前都会发按钮请你明确同意。\n\
-                 发送 /new 可以开启新会话（清空对话历史）。",
-            )
-            .await?;
+        send_md(state.bot.send_message(
+            chat_id,
+            "👋 我是 ying！直接发文本或图片就行。\n\
+                     我可以用 `bash` 跑命令、`read` 读文件，\n\
+                     也能看你发的图片、看电脑上的图片（vision）。\n\
+                     每次调用工具前都会发按钮请你明确同意。\n\
+                     发送 /new 可以开启新会话（清空对话历史）。",
+        ))
+        .await?;
         return Ok(true);
     }
     if text.starts_with("/new") {
         state.histories.lock().await.remove(&chat_id);
         // 会话结束：下一条消息会创建新的会话文件
         state.sessions.lock().await.remove(&chat_id);
-        state
-            .bot
-            .send_message(chat_id, "🆕 新会话已开始，之前的对话历史已清空。")
-            .await?;
+        send_md(
+            state
+                .bot
+                .send_message(chat_id, "🆕 新会话已开始，之前的对话历史已清空。"),
+        )
+        .await?;
         return Ok(true);
     }
     Ok(false)
@@ -393,7 +398,7 @@ impl StreamCollector {
     async fn push_text(&mut self, text: String) {
         self.preview.push_str(&text);
         if self.placeholder.is_none() {
-            match self.bot.send_message(self.chat_id, "🤔 思考中…").await {
+            match send_md(self.bot.send_message(self.chat_id, "🤔 思考中…")).await {
                 Ok(m) => self.placeholder = Some(m.id),
                 Err(e) => tracing::warn!("占位消息发送失败（下个文本再试）: {e}"),
             }
@@ -402,10 +407,11 @@ impl StreamCollector {
         if let Some(pid) = self.placeholder
             && self.last_edit.elapsed() >= self.next_wait
         {
-            match self
-                .bot
-                .edit_message_text(self.chat_id, pid, self.preview.clone())
-                .await
+            match edit_md(
+                self.bot
+                    .edit_message_text(self.chat_id, pid, self.preview.clone()),
+            )
+            .await
             {
                 Ok(_) => {
                     self.preview_sent = self.preview.clone();
@@ -425,10 +431,12 @@ impl StreamCollector {
                 if let Err(e) = self.bot.delete_message(self.chat_id, pid).await {
                     tracing::warn!("删除占位消息失败： {e}");
                 }
-            } else if let Err(e) = self
-                .bot
-                .edit_message_text(self.chat_id, pid, format!("📝 {}", self.preview))
-                .await
+            } else if let Err(e) = edit_md(self.bot.edit_message_text(
+                self.chat_id,
+                pid,
+                format!("📝 {}", self.preview),
+            ))
+            .await
             {
                 tracing::warn!("中间输出定稿失败： {e}");
             }
@@ -475,14 +483,14 @@ impl StreamCollector {
     async fn write_final(&mut self, reply: &str) -> HandlerResult {
         match self.placeholder {
             Some(pid) if !reply.is_empty() && reply != self.preview_sent => {
-                self.bot
-                    .edit_message_text(self.chat_id, pid, reply.to_string())
-                    .await?;
+                edit_md(
+                    self.bot
+                        .edit_message_text(self.chat_id, pid, reply.to_string()),
+                )
+                .await?;
             }
             None if !reply.is_empty() => {
-                self.bot
-                    .send_message(self.chat_id, reply.to_string())
-                    .await?;
+                send_md(self.bot.send_message(self.chat_id, reply.to_string())).await?;
             }
             Some(pid) if reply.is_empty() => {
                 let _ = self.bot.delete_message(self.chat_id, pid).await;
@@ -584,17 +592,19 @@ pub async fn on_callback(state: AppState, q: CallbackQuery) -> HandlerResult {
             tracing::warn!("找不到审批日志（可能已处理或已过期）: {} → {}", action, id);
             if let Some(m) = q.message.as_ref().and_then(|m| m.regular_message()) {
                 let text = m.text().unwrap_or_default();
-                let _ = state
-                    .bot
-                    .edit_message_text(
-                        m.chat.id,
-                        m.id,
-                        decided_text("⏳ 该审批已处理或已过期", text),
-                    )
-                    .reply_markup(InlineKeyboardMarkup {
-                        inline_keyboard: vec![],
-                    })
-                    .await;
+                let _ = edit_md(
+                    state
+                        .bot
+                        .edit_message_text(
+                            m.chat.id,
+                            m.id,
+                            decided_text("⏳ 该审批已处理或已过期", text),
+                        )
+                        .reply_markup(InlineKeyboardMarkup {
+                            inline_keyboard: vec![],
+                        }),
+                )
+                .await;
             }
             let _ = state
                 .bot

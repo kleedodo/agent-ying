@@ -4,6 +4,7 @@ mod handlers;
 mod image;
 mod journal;
 mod media;
+mod send;
 mod skills;
 mod tools;
 mod usermsg;

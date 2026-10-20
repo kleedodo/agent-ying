@@ -16,6 +16,7 @@ use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
 use tokio::sync::{Mutex, oneshot};
 use tokio::time::Duration;
 
+use crate::send::{edit_md, send_md};
 use crate::tools::edit::EditArgs;
 use crate::tools::edit_algo::{self, Edit as EditData};
 use crate::tools::read::DEFAULT_READ_LIMIT;
@@ -239,10 +240,11 @@ impl ApprovalManager {
             .remove(id)
             .is_some_and(|tx| tx.send(approve).is_ok());
         let (text, pending) = render_log(&log.entries, log.finished);
-        let _ = bot
-            .edit_message_text(chat_id, log.message_id, text)
-            .reply_markup(keyboard_for(pending.as_deref()))
-            .await;
+        let _ = edit_md(
+            bot.edit_message_text(chat_id, log.message_id, text)
+                .reply_markup(keyboard_for(pending.as_deref())),
+        )
+        .await;
         ResolveOutcome::Resolved
     }
 
@@ -257,10 +259,11 @@ impl ApprovalManager {
         }
         log.finished = true;
         let (text, pending) = render_log(&log.entries, log.finished);
-        let _ = bot
-            .edit_message_text(chat_id, log.message_id, text)
-            .reply_markup(keyboard_for(pending.as_deref()))
-            .await;
+        let _ = edit_md(
+            bot.edit_message_text(chat_id, log.message_id, text)
+                .reply_markup(keyboard_for(pending.as_deref())),
+        )
+        .await;
     }
 }
 
@@ -326,10 +329,11 @@ pub async fn request_approval(
             // 冻结当前消息：此刻旧记录已全部决定（待审批的已按「被取代」拒绝），摘掉按钮即可
             if log.message_id.0 != 0 && !log.entries.is_empty() {
                 let (frozen_text, _) = render_log(&log.entries, false);
-                if let Err(e) = bot
-                    .edit_message_text(chat_id, log.message_id, frozen_text)
-                    .reply_markup(keyboard_for(None))
-                    .await
+                if let Err(e) = edit_md(
+                    bot.edit_message_text(chat_id, log.message_id, frozen_text)
+                        .reply_markup(keyboard_for(None)),
+                )
+                .await
                 {
                     tracing::warn!("编辑被冻结的审批日志消息失败： {e}");
                 }
@@ -345,7 +349,7 @@ pub async fn request_approval(
                     total,
                     chunk.replace('\n', "\n   ")
                 );
-                if let Err(e) = bot.send_message(chat_id, text).await {
+                if let Err(e) = send_md(bot.send_message(chat_id, text)).await {
                     return Err(e.to_string());
                 }
             }
@@ -360,18 +364,19 @@ pub async fn request_approval(
         let (text, _) = render_log(&log.entries, log.finished);
         let kb = keyboard_for(Some(&id));
         let sent = if log.message_id.0 == 0 {
-            bot.send_message(chat_id, text).reply_markup(kb).await
+            send_md(bot.send_message(chat_id, text).reply_markup(kb)).await
         } else {
-            match bot
-                .edit_message_text(chat_id, log.message_id, text.clone())
-                .reply_markup(kb.clone())
-                .await
+            match edit_md(
+                bot.edit_message_text(chat_id, log.message_id, text.clone())
+                    .reply_markup(kb.clone()),
+            )
+            .await
             {
                 Ok(m) => Ok(m),
                 // 旧消息编辑不了（如被用户删除）就重新发一条日志消息
                 Err(e) => {
                     tracing::warn!("编辑审批日志消息失败，改发新消息： {e}");
-                    bot.send_message(chat_id, text).reply_markup(kb).await
+                    send_md(bot.send_message(chat_id, text).reply_markup(kb)).await
                 }
             }
         };
@@ -405,10 +410,11 @@ pub async fn request_approval(
                         e.decision = Some(Decision::Timeout);
                     }
                     let (text, pending) = render_log(&log.entries, log.finished);
-                    let _ = bot
-                        .edit_message_text(chat_id, log.message_id, text)
-                        .reply_markup(keyboard_for(pending.as_deref()))
-                        .await;
+                    let _ = edit_md(
+                        bot.edit_message_text(chat_id, log.message_id, text)
+                            .reply_markup(keyboard_for(pending.as_deref())),
+                    )
+                    .await;
                 }
             }
             // 摘掉待审批项，防止迟到的点击命中已超时的审批
