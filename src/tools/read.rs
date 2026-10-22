@@ -141,9 +141,10 @@ impl Tool for Read {
         // 首行单行即超 50KB：正常返回提示让 agent 改用 bash（不算工具错误）
         // 提示先物化该行到临时文件：前缀只扫一次，之后每段续读都是 O(1) seek
         if sel_lines.first().is_some_and(|l| l.len() > MAX_READ_BYTES) {
-            let tmp = format!("/tmp/huge_line_{start_display}.txt");
+            let tmp_dir = "/tmp/agent-ying";
+            let tmp = format!("{tmp_dir}/huge_line_{start_display}.txt");
             return Ok(format!(
-                "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash 先抽取该行：`sed -n '{start_display}p' {} > {tmp}`，再看前 {MAX_READ_BYTES} 字节：`head -c {MAX_READ_BYTES} {tmp}`；继续读下一段：`tail -c +{next} {tmp} | head -c {MAX_READ_BYTES}`（临时文件会保留，后续每段只需 seek，不用重扫前缀）。]",
+                "[第 {start_display} 行大小 {}，超过 {} 上限。可用 bash 先抽取该行：`mkdir -p {tmp_dir} && sed -n '{start_display}p' {} > {tmp}`，再看前 {MAX_READ_BYTES} 字节：`head -c {MAX_READ_BYTES} {tmp}`；继续读下一段：`tail -c +{next} {tmp} | head -c {MAX_READ_BYTES}`（临时文件会保留，后续每段只需 seek，不用重扫前缀）。]",
                 human_size(sel_lines[0].len() as u64),
                 human_size(MAX_READ_BYTES as u64),
                 args.path,

@@ -340,7 +340,9 @@ mod tests {
 
     #[tokio::test]
     async fn append_round_keeps_full_tool_result_and_demotes_image() {
-        let dir = std::env::temp_dir().join(format!("journal-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir()
+            .join("agent-ying")
+            .join(format!("journal-test-{}", Uuid::new_v4()));
         let session = SessionFile {
             path: dir.join("messages.jsonl"),
             dir: dir.clone(),
@@ -391,7 +393,9 @@ mod tests {
 
     #[tokio::test]
     async fn append_round_refers_existing_toolout_file() {
-        let dir = std::env::temp_dir().join(format!("journal-test-{}", Uuid::new_v4()));
+        let dir = std::env::temp_dir()
+            .join("agent-ying")
+            .join(format!("journal-test-{}", Uuid::new_v4()));
         let session = SessionFile {
             path: dir.join("messages.jsonl"),
             dir: dir.clone(),

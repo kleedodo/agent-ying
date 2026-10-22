@@ -723,7 +723,9 @@ mod tests {
     #[tokio::test]
     async fn describe_detail_edit_shows_diff_and_falls_back_without_file() {
         // 能读到文件：带上改动行数和每条编辑的预览
-        let dir = std::env::temp_dir().join(format!("ying-hook-test-{}", std::process::id()));
+        let dir = std::env::temp_dir()
+            .join("agent-ying")
+            .join(format!("ying-hook-test-{}", std::process::id()));
         tokio::fs::create_dir_all(&dir).await.unwrap();
         let path = dir.join("a.txt");
         tokio::fs::write(&path, "foo\nbar\n").await.unwrap();
