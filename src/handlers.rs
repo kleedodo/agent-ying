@@ -3,10 +3,9 @@
 use std::time::Duration;
 
 use futures::StreamExt;
-use rig::agent::StreamingError;
-use rig::completion::Message as RigMessage;
-use rig::prelude::{MultiTurnStreamItem, StreamingChat};
-use rig::streaming::StreamedAssistantContent;
+use rig::agent::MultiTurnStreamItem;
+use rig::completion::{Message as RigMessage, PromptError};
+use rig::streaming::{Item, PartKind, StreamEvent};
 use std::collections::HashMap;
 use teloxide::prelude::*;
 
@@ -125,7 +124,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
 
     // 流式跑 agent：文本增量实时刷到占位消息（节流防触发 Telegram 限频）,
     // 最终回复与本轮新增历史以 FinalResponse 为准
-    let mut stream = agent.stream_chat(user_msg, history.clone()).await;
+    let mut stream = agent.prompt(user_msg).history(history.clone()).stream();
     let mut collector = StreamCollector::new(
         state.bot.clone(),
         chat_id,
@@ -363,17 +362,21 @@ impl StreamCollector {
     /// 处理一个流项；返回 Some 表示流到达终态
     async fn handle(
         &mut self,
-        item: Result<MultiTurnStreamItem, StreamingError>,
+        item: Result<MultiTurnStreamItem, PromptError>,
     ) -> Option<StreamTerminal> {
         match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::Text(text))) => {
-                self.push_text(text.text).await;
+            Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Text {
+                text,
+                ..
+            }))) => {
+                self.push_text(text).await;
                 None
             }
-            // 模型发起工具调用：之前的文本是中间轮次的输出，定稿/删除占位消息
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamedAssistantContent::ToolCall {
+            // 模型发起工具调用（工具名已确定）：之前的文本是中间轮次的输出，定稿/删除占位消息
+            Ok(MultiTurnStreamItem::StreamAssistantItem(Item::Event(StreamEvent::Start {
+                kind: PartKind::ToolCall,
                 ..
-            })) => {
+            }))) => {
                 self.finalize_intermediate().await;
                 None
             }
@@ -383,10 +386,10 @@ impl StreamCollector {
                 None
             }
             Ok(MultiTurnStreamItem::FinalResponse(resp)) => {
+                self.final_output = Some(resp.output());
                 // resp.messages 是本轮新增消息（含用户输入），接在旧历史后面
-                self.new_messages = resp.messages.unwrap_or_default();
+                self.new_messages = resp.messages;
                 self.history.extend(self.new_messages.clone());
-                self.final_output = Some(resp.output);
                 Some(StreamTerminal::Finished)
             }
             Ok(_) => None,

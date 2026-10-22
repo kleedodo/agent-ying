@@ -4,11 +4,11 @@ use std::path::Path;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use rig::client::AgentClientExt;
+use rig::agent::AgentBuilder;
+use rig::completion::Message as RigMessage;
 use rig::completion::message::{
     DocumentSourceKind, Image as RigImage, ImageMediaType, Text as RigText, UserContent,
 };
-use rig::completion::{Chat, Message as RigMessage};
 use rig::providers::openai;
 use rig::tool::{Tool, ToolContext};
 use serde::Deserialize;
@@ -26,7 +26,7 @@ pub struct VisionArgs {
 /// 看图工具：用多模态模型看图片，调用前先请用户审批。
 #[derive(Clone)]
 pub struct Vision {
-    pub client: openai::CompletionsClient,
+    pub client: openai::OpenAI,
     pub model: String,
     /// 解析后的 vision 系统提示词（可被 VISION_SYSTEM.md 覆盖）
     pub system_prompt: String,
@@ -131,21 +131,13 @@ impl Tool for Vision {
                 data: DocumentSourceKind::base64(&b64),
                 media_type: Some(media_type),
                 detail: None,
-                additional_params: None,
+                native: None,
             });
-            let content = vec![
-                UserContent::Text(RigText {
-                    text: "请看这张图片。".to_string(),
-                    additional_params: None,
-                }),
-                image,
-            ];
+            let content = vec![UserContent::Text(RigText::new("请看这张图片。")), image];
             let user_msg = RigMessage::User { content };
 
             // 5. 构建 vision agent 并调用（单轮，无需历史）
-            let agent = self
-                .client
-                .agent(self.model.clone())
+            let agent = AgentBuilder::new(self.client.completion(self.model.clone()))
                 .name("vision")
                 .preamble(&self.system_prompt)
                 .build();
@@ -153,7 +145,8 @@ impl Tool for Vision {
             let reply = agent
                 .chat(user_msg, &mut history)
                 .await
-                .map_err(|e| ToolErr(format!("vision 模型调用失败：{e}")))?;
+                .map_err(|e| ToolErr(format!("vision 模型调用失败：{e}")))?
+                .output();
 
             tracing::info!(
                 "vision 完成：{}（{} 字符）",

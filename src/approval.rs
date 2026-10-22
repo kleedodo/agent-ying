@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use rig::agent::hook::{AgentHook, HookContext, ToolCall, ToolCallAction};
+use rig::agent::hook::{AgentHook, DispatchAction, DispatchEvent, HookContext};
 use serde_json::Value;
 use teloxide::prelude::*;
 use teloxide::types::{InlineKeyboardButton, InlineKeyboardMarkup, MessageId};
@@ -428,8 +428,8 @@ pub async fn request_approval(
     Ok(approved)
 }
 
-/// 审批钩子（rig `AgentHook`）：每个工具**体**执行前触发，统一做 Telegram 按钮审批。
-/// 同意 → `Run`（执行工具体）；拒绝/超时 → `Skip`（工具体不执行，理由原样喂回模型）；
+/// 审批钩子（rig `AgentHook`）：每个工具**体**执行前（dispatch 边界）触发，统一做 Telegram 按钮审批。
+/// 同意 → `Proceed`（执行工具体）；拒绝/超时 → `Skip`（工具体不执行，理由原样喂回模型）；
 /// 审批消息都发不出去 → `Stop` 结束本轮（用户没看到审批卡，继续跑没意义）。
 /// 审批是「run 级策略」，工具本身不需要知道它的存在。
 #[derive(Clone)]
@@ -452,30 +452,37 @@ impl ApprovalHook {
 }
 
 impl AgentHook for ApprovalHook {
-    async fn on_tool_call(&self, _ctx: &HookContext, event: ToolCall<'_>) -> ToolCallAction {
-        let args: Value = serde_json::from_str(event.args).unwrap_or(Value::Null);
-        let detail = describe_detail(event.tool_name, &args).await;
+    async fn on_dispatch(&self, _ctx: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        // 非工具调用（补全等 dispatch）不审批，直接放行
+        let Some(tool_name) = event.tool_name() else {
+            return DispatchAction::proceed();
+        };
+        let args: Value = event
+            .tool_args()
+            .and_then(|a| serde_json::from_str(a).ok())
+            .unwrap_or(Value::Null);
+        let detail = describe_detail(tool_name, &args).await;
         match request_approval(
             &self.bot,
             self.chat_id,
             &self.approvals,
             self.timeout,
-            event.tool_name,
+            tool_name,
             &detail,
         )
         .await
         {
-            Ok(true) => ToolCallAction::run(),
+            Ok(true) => DispatchAction::proceed(),
             Ok(false) => {
-                let target = describe_target(event.tool_name, &args);
+                let target = describe_target(tool_name, &args);
                 tracing::info!("{target} 被用户拒绝");
-                ToolCallAction::skip(format!(
+                DispatchAction::skip(format!(
                     "用户明确拒绝了本次调用：{target}。这不是工具报错——不要重试同一操作或换参数再试，直接回复用户并询问拒绝原因。"
                 ))
             }
             Err(e) => {
                 tracing::error!("审批请求发送失败： {e}");
-                ToolCallAction::stop(format!("审批请求发送失败： {e}"))
+                DispatchAction::stop(format!("审批请求发送失败： {e}"))
             }
         }
     }

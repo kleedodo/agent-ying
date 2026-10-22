@@ -214,10 +214,7 @@ fn media_image_text_message(
 /// 构造纯文本用户消息。
 fn text_user_message(text: String) -> RigMessage {
     RigMessage::User {
-        content: vec![UserContent::Text(RigText {
-            text,
-            additional_params: None,
-        })],
+        content: vec![UserContent::Text(RigText::new(text))],
     }
 }
 
@@ -230,15 +227,9 @@ fn image_user_message(text: String, bytes: Vec<u8>, media_type: ImageMediaType) 
         data: DocumentSourceKind::base64(&b64),
         media_type: Some(media_type),
         detail: None,
-        additional_params: None,
+        native: None,
     });
-    let content = vec![
-        UserContent::Text(RigText {
-            text,
-            additional_params: None,
-        }),
-        image,
-    ];
+    let content = vec![UserContent::Text(RigText::new(text)), image];
     RigMessage::User { content }
 }
 

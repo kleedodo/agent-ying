@@ -324,7 +324,7 @@ mod tests {
             "content": [
                 {
                     "type": "toolresult",
-                    "call": "c1",
+                    "call": { "provider": "c1" },
                     "name": "bash",
                     "content": [{ "type": "text", "text": long }]
                 },
@@ -414,7 +414,7 @@ mod tests {
             "role": "user",
             "content": [{
                 "type": "toolresult",
-                "call": "c1",
+                "call": { "provider": "c1" },
                 "name": "bash",
                 "content": [{ "type": "text", "text": format!("{long}\n\n（{note}）") }]
             }]

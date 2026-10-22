@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rig::client::AgentClientExt;
+use rig::agent::AgentBuilder;
 use rig::completion::Message;
 use rig::providers::openai;
 use teloxide::prelude::*;
@@ -38,7 +38,7 @@ type YingAgent = rig::agent::Agent;
 #[derive(Clone)]
 struct AppState {
     bot: Bot,
-    client: openai::CompletionsClient,
+    client: openai::OpenAI,
     approvals: ApprovalManager,
     histories: Arc<Mutex<HashMap<ChatId, Vec<Message>>>>,
     /// 会话日志（journals/）记录器
@@ -53,7 +53,7 @@ struct AppState {
     forward_to_vision: bool,
     vision_model: String,
     /// None 表示 vision_model 留空、未启用 vision agent
-    vision_client: Option<openai::CompletionsClient>,
+    vision_client: Option<openai::OpenAI>,
     vision_system_prompt: String,
     system_prompt: String,
     bash_timeout: Duration,
@@ -79,9 +79,7 @@ impl AppState {
             bash_timeout: self.bash_timeout,
             toolout_dir,
         };
-        let mut builder = self
-            .client
-            .agent(self.model.clone())
+        let mut builder = AgentBuilder::new(self.client.completion(self.model.clone()))
             .name(&self.name)
             .preamble(&self.system_prompt)
             .tool(Bash(ctx.clone()))
@@ -131,14 +129,12 @@ fn build_handler() -> dptree::Handler<
 fn build_openai_client(
     api_key: &str,
     base_url: Option<&str>,
-) -> Result<openai::CompletionsClient, Box<dyn std::error::Error + Send + Sync>> {
-    match base_url {
-        Some(b) if !b.is_empty() => Ok(openai::CompletionsClient::builder()
-            .api_key(api_key)
-            .base_url(b)
-            .build()?),
-        _ => Ok(openai::CompletionsClient::new(api_key.to_string())?),
+) -> Result<openai::OpenAI, Box<dyn std::error::Error + Send + Sync>> {
+    let mut config = openai::OpenAIConfig::new(api_key.to_string());
+    if let Some(b) = base_url.filter(|b| !b.is_empty()) {
+        config.base_url = b.to_string();
     }
+    Ok(config.client())
 }
 
 #[tokio::main]
