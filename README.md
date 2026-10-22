@@ -10,13 +10,13 @@
 - **多模态输入**：`forward_to_vision: true`（默认，主模型非多模态时）且 vision 已启用时，用户发的图片先压缩到 256KB 以下、存到会话 `media/` 目录，并提示主 agent 调 vision 工具查看；为 `false` 或 vision 未启用时，图片压缩后以 data URL 形式直接内嵌发给主模型。文档/视频/音频 ≤50MB 时自动下载到会话 `media/` 目录，并把落盘路径与大小告诉主模型；超限只把元数据（文件名、大小、视频时长、消息 ID）告诉主模型，不下载本体
 - **工具调用**:
   - `bash`：在用户的电脑上执行 shell 命令（可配置超时，输出超长自动截断）
-  - `read`：读取一个文本文件（如 SKILL.md 或其他任意文件，绝对路径或相对当前工作目录），只读；从第 1 行起最多读 2000 行或 50KB（先到者为准），可用 offset / limit 分页续读
+  - `read`：读取一个文本文件（如 SKILL.md 或其他任意文件，只接受绝对路径），只读；从第 1 行起最多读 2000 行或 50KB（先到者为准），可用 offset / limit 分页续读
   - `write`：写入文件，不存在则创建、存在则覆盖，自动创建父目录；只适合新建或完整重写
   - `edit`：精确文本替换——`edits[]` 里的每条 `oldText` 必须原样唯一命中且互不重叠，一次调用可带多条互不重叠的编辑（全部对着同一份原始文件匹配，非增量）；支持智能引号/破折号/行尾空白等模糊匹配兜底，保留原文件 BOM 与 CRLF；审批卡片里直接展示改动 diff
   - `vision`：看图工具——文字图（截图/文档/代码）按原结构提取文字，风景/照片等非文字内容详细描述；由独立的多模态 agent 驱动，可单独配置模型 / API key / base URL,`vision_model` 留空则不启用
 - **按钮审批**：每次调用工具前都需用户点「同意」才执行；一轮内的所有审批合并到同一条「审批日志」消息（已决定的条目内联展示，最新待审批条目带「同意 / 拒绝」按钮，本轮结束追加「🏁 本轮结束」尾注）；超时未点按拒绝处理。所有工具（包括只读的 read）都必须经过审批
-- **用户白名单**：可配置只响应指定的 Telegram user id
-- **会话管理**:`/new` 命令清空当前对话历史，开启新会话
+- **用户白名单**：可配置只对指定的 Telegram user id 提供工具服务；未授权用户会被告知自己的 user id（每人每 30 分钟最多 3 次）
+- **会话管理**:`/new` 命令清空当前对话历史，开启新会话；`/start`、`/help` 显示帮助说明
 - **流式回复**：先发送「正在输入」状态，每轮首个文本到达时创建"🤔 思考中…"占位消息，模型流式输出时增量编辑刷新成回复正文；每次编辑前随机等待 200ms~`stream_edit_interval_ms`（防触发 Telegram 限频）；模型发起工具调用时，中间文本定稿为「📝 …」消息，保证最终回复始终排在审批消息之后
 - **可定制人设**：系统提示词支持本地文件覆盖（见下文）
 
@@ -66,7 +66,7 @@ cargo build --release
 | `vision_base_url` | vision 专用 base URL，留空则回退到 `openai_base_url`（再留空用官方 `https://api.openai.com/v1`） |
 | `bash_timeout_secs` | bash 工具执行超时（秒），默认 60 |
 | `approval_timeout_secs` | 审批等待超时（秒），超时按拒绝处理，默认 60 |
-| `allowed_user_ids` | 只响应这些 Telegram user id，留空则响应所有人 |
+| `allowed_user_ids` | 只对这些人提供工具服务（未授权用户只会被告知其 user id），留空则对所有人开放 |
 | `temperature` | 采样温度，默认 1.0 |
 | `max_turns` | agent 单次对话最大工具轮数，默认 5000 |
 | `max_tokens` | 单次模型响应最大 token 数，默认 32768 |
@@ -98,7 +98,7 @@ vision agent（看图工具）有自己独立的系统提示词，同样支持�
 
 ## 技能（Skills）
 
-技能用于给 agent 提供特定任务的专门指令，采用渐进式披露：启动时只把每个技能的 name + description 拼进系统提示，模型判断任务匹配某个技能时，再用 `read` 工具读取完整的 SKILL.md。
+技能用于给 agent 提供特定任务的专门指令，采用渐进式披露：启动时把每个技能的 name、description 和 SKILL.md 路径（`<location>`）连同使用规则（如「被问有哪些技能时不必读文件」「技能提到的环境变量不可读取/打印其值」）拼进系统提示末尾，模型判断任务匹配某个技能时，再用 `read` 工具读取完整的 SKILL.md。
 
 ### 配置方法
 
@@ -153,35 +153,11 @@ vision agent（看图工具）有自己独立的系统提示词，同样支持�
 - toolout 文件超过 50KB 才 gzip 压缩（小结果保留纯文本），轮转的 jsonl 一律 gzip；压缩文件可用 `zgrep 关键词 …` 查看/搜索；单个工具结果最多保存前 256MB
 - 没有定期清理；需要腾空间时按会话目录（或月目录）整删即可，会话目录是自包含单位，引用都是相对路径，搬走不会失效
 
-## 项目结构
-
-```
-src/
-├── main.rs        # 入口：配置加载、agent 构建、dptree handler 注册
-├── config.rs      # ~/.agent-ying/config.json 的加载与默认模板
-├── handlers.rs    # Telegram 消息 / 按钮回调处理，流式回复与占位消息管理
-├── usermsg.rs     # 从 Telegram 消息构建发给模型的用户消息（图片内嵌 / 转存 media/ / 媒体元数据）
-├── image.rs       # 图片压缩到 256KB 以下、MIME 到 rig 图片类型的映射
-├── media.rs       # 用户发来的文件下载、落盘到会话 media/ 目录与命名
-├── journal.rs     # 会话日志：每会话一个自包含目录（jsonl 轮转 + images/ + media/ + toolout/）
-├── skills.rs      # 扫描 ~/.agent-ying/skills/，生成系统提示里的技能索引
-├── approval.rs    # 工具执行前的 Telegram 按钮审批（每轮合并为一条审批日志消息）
-└── tools/         # rig 工具：每工具一个子文件，共享上下文 / 错误类型 / 结果落盘
-    ├── mod.rs     # ToolCtx、ToolErr、record_tool_result（全文落盘）
-    ├── bash.rs    # bash 工具
-    ├── read.rs    # read 工具
-    ├── write.rs   # write 工具
-    ├── edit.rs    # edit 工具（多编辑参数校验与编排）
-    ├── edit_algo.rs # edit 核心算法：换行/BOM 规范化、模糊匹配、替换应用、diff 生成
-    └── vision.rs  # vision 工具（独立多模态 agent 看图）
-```
-
 ## 技术要点
 
 - **rustls 全链路**:teloxide 关闭默认 native-tls，与 rig 统一走 rustls，方便静态链接
 - **mimalloc 全局分配器**：抗内存碎片，降低常驻内存，支持 musl 静态构建
 - **审批与消息并行分发**:teloxide 默认按 chat 串行处理 update，但审批按钮回调若也排队会死锁（等按钮 → 按钮等消息结束），因此 `callback_query` 走并行 worker，文本消息仍保持每 chat 串行
-- **流式多轮对话**：基于 rig 的 `stream_chat` + `MultiTurnStreamItem`，文本增量按随机间隔节流写入占位消息；最终回复正文与本轮新增历史均以 `FinalResponse` 为准，流中断时按已有预览兜底
 
 ## 开发
 
