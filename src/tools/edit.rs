@@ -172,6 +172,7 @@ impl Tool for Edit {
             args.edits.len(),
             args.path
         );
-        record_tool_result(&ctx.toolout_dir, &report).await
+        record_tool_result(&ctx.toolout_dir, &report).await?;
+        Ok(report)
     }
 }

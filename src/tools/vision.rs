@@ -161,8 +161,9 @@ impl Tool for Vision {
                 reply.chars().count()
             );
 
-            // 6. 全文落盘并注明保存位置，超长则返回头尾摘要
-            record_tool_result(&ctx.toolout_dir, &reply).await
+            // 6. 全文落盘备查
+            record_tool_result(&ctx.toolout_dir, &reply).await?;
+            Ok(reply)
         }
         .await;
 

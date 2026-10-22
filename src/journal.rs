@@ -17,8 +17,8 @@
 //!
 //! 每行一条消息：`{"ts", "round", "seq", "msg"}`。
 //! - `round` 是本轮的 uuid（每次用户消息一个）,`seq` 是轮内序号
-//! - 工具结果文本完整写入 jsonl（即 agent 看到的内容；上游 record_tool_result
-//!   已把长输出限长到 ~9KB）；若文本里带保存位置，附 `result_ref` 指向 toolout/ 里的原始全文
+//! - 工具结果文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 把超长输出
+//!   截成头尾摘要）；若文本里带保存位置，附 `result_ref` 指向 toolout/ 里的原始全文
 //! - 图片内容存 `images/` 下的文件，消息里只留 `image_ref`，不保留 base64
 //! - 没有定期清理；需要腾空间时按会话目录或月目录整删即可
 
@@ -260,9 +260,9 @@ impl SessionFile {
         obj.insert("image_ref".into(), json!(format!("images/{name}")));
     }
 
-    /// 工具结果文本完整写入 jsonl（即 agent 看到的内容；上游 record_tool_result
-    /// 已把长输出限长到 ~9KB）。若文本里带 record_tool_result 的保存位置提示，
-    /// 附 result_ref 指向 toolout/ 里的原始全文（模型可用它取回被省略的中间部分）
+    /// 工具结果文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 输出会被工具侧
+    /// 截成头尾摘要）。若文本里带保存位置提示，附 result_ref 指向 toolout/ 里的原始全文
+    /// （模型可用它取回被省略的中间部分）
     async fn annotate_tool_text(&self, r: &mut Value) {
         let Some(text) = r.get("text").and_then(Value::as_str) else {
             return;

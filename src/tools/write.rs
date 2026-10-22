@@ -83,6 +83,7 @@ impl Tool for Write {
             args.content.len(),
             args.path
         );
-        record_tool_result(&ctx.toolout_dir, &report).await
+        record_tool_result(&ctx.toolout_dir, &report).await?;
+        Ok(report)
     }
 }

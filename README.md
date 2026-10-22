@@ -146,10 +146,10 @@ vision agent（看图工具）有自己独立的系统提示词，同样支持�
 ```
 
 - `round` 是本轮的 uuid（每次用户消息一个）,`seq` 是轮内序号；流异常时至少会记录用户消息
-- 工具结果：文本完整写入 jsonl（即 agent 看到的内容；工具侧已把长输出截成头尾摘要、原始全文落 `toolout/`）；若文本里带保存位置，附 `result_ref` 指向 `toolout/` 里的原始全文文件
+- 工具结果：文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 的超长输出会被截成头尾摘要、原始全文落 `toolout/`）；若文本里带保存位置，附 `result_ref` 指向 `toolout/` 里的原始全文文件
 - 图片：base64 不留在 jsonl 里，解码后存入同级 `images/`，消息里只留 `image_ref: "images/<uuid>.jpg"`
 - 媒体：`forward_to_vision` 时用户发的图片，以及 ≤50MB 的文档/视频/音频，落盘到 `media/`（命名 `<uuid>-<原文件名>`），jsonl 里只在消息文本中带落盘路径
-- 另外，所有工具返回给模型前都会把全文落盘到当前会话的 `toolout/<uuid>.txt.gz`，并在返回文本中注明保存位置（超长时返回头尾摘要），模型可用 bash 按需查看
+- 另外，所有工具返回给模型前都会把全文落盘到当前会话的 `toolout/`；目前只有 bash 的超长输出会截成头尾摘要并在返回文本中注明保存位置，模型可用 bash 按需查看
 - toolout 文件超过 50KB 才 gzip 压缩（小结果保留纯文本），轮转的 jsonl 一律 gzip；压缩文件可用 `zgrep 关键词 …` 查看/搜索；单个工具结果最多保存前 256MB
 - 没有定期清理；需要腾空间时按会话目录（或月目录）整删即可，会话目录是自包含单位，引用都是相对路径，搬走不会失效
 
@@ -167,7 +167,7 @@ src/
 ├── skills.rs      # 扫描 ~/.agent-ying/skills/，生成系统提示里的技能索引
 ├── approval.rs    # 工具执行前的 Telegram 按钮审批（每轮合并为一条审批日志消息）
 └── tools/         # rig 工具：每工具一个子文件，共享上下文 / 错误类型 / 结果落盘
-    ├── mod.rs     # ToolCtx、ToolErr、record_tool_result（全文落盘 + 头尾摘要）
+    ├── mod.rs     # ToolCtx、ToolErr、record_tool_result（全文落盘）
     ├── bash.rs    # bash 工具
     ├── read.rs    # read 工具
     ├── write.rs   # write 工具
