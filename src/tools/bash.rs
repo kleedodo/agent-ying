@@ -9,31 +9,65 @@ use super::{ToolCtx, ToolErr, record_tool_result};
 
 /// bash 输出超过该字符数时返回头尾摘要（全文始终落盘）
 /// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给摘要让模型按需取
-const MAX_OUTPUT_CHARS: usize = 8000;
-/// 摘要中保留的头部字符数（与尾部之和须小于 MAX_OUTPUT_CHARS）
-const SPILL_HEAD_CHARS: usize = 3000;
-/// 摘要中保留的尾部字符数
-const SPILL_TAIL_CHARS: usize = 2000;
+const MAX_OUTPUT_CHARS: usize = 16000;
+/// 摘要中保留的头部字符数（MAX_OUTPUT_CHARS 按 5:3 分给头部）
+const SPILL_HEAD_CHARS: usize = MAX_OUTPUT_CHARS * 5 / 8;
+/// 摘要中保留的尾部字符数（补齐剩余，硬性保证两者之和等于 MAX_OUTPUT_CHARS）
+const SPILL_TAIL_CHARS: usize = MAX_OUTPUT_CHARS - SPILL_HEAD_CHARS;
 
-/// 把超长的 bash 输出截成头 + 尾摘要，并注明全文保存位置
+/// 把超长的 bash 输出截成头 + 尾摘要，注明省略的行区间和全文保存位置
+/// 提示措辞刻意用"仅当需要时"的条件式，避免诱导模型在信息已足够时二次调用
 fn spill_to_summary(s: &str, path: &Path) -> String {
     let total = s.chars().count();
     if total <= MAX_OUTPUT_CHARS {
         return s.to_string();
     }
-    // 完整路径只在保存说明里出现一次；命令只给工具名不重复拼路径，省 token
+    let lines: Vec<&str> = s.lines().collect();
+    // 从两端按行取，各自不超字符预算，保证按行边界截断不切碎行
+    let mut head: Vec<&str> = Vec::new();
+    let mut h = 0;
+    for line in &lines {
+        let n = line.chars().count() + 1;
+        if h + n <= SPILL_HEAD_CHARS {
+            head.push(line);
+            h += n;
+        } else {
+            break;
+        }
+    }
+    let mut tail: Vec<&str> = Vec::new();
+    let mut t = 0;
+    for line in lines.iter().rev() {
+        let n = line.chars().count() + 1;
+        if t + n <= SPILL_TAIL_CHARS {
+            tail.insert(0, line);
+            t += n;
+        } else {
+            break;
+        }
+    }
+
+    // 完整路径只在保存说明里出现一次，省 token；提示是条件式的，且给出精准取段命令
     let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
-    let cmd_hint = if is_gz {
-        "可用 zgrep 查看/搜索该文件"
+    let (dropped_note, fetch_hint) = if head.len() + tail.len() < lines.len() {
+        let a = head.len() + 1;
+        let b = lines.len() - tail.len();
+        let fetch = if is_gz {
+            format!("用 `zcat` + `sed -n '{a},{b}p'` 查看")
+        } else {
+            format!("用 `sed -n '{a},{b}p'` 查看")
+        };
+        (format!("共 {} 行，已省略第 {a}–{b} 行", lines.len()), fetch)
     } else {
-        "可用 cat 查看、grep 搜索、sed/tail 截取该文件"
+        (format!("共 {} 字符", total), "查看该文件".into())
     };
-    let head: String = s.chars().take(SPILL_HEAD_CHARS).collect();
-    let tail: String = s.chars().skip(total - SPILL_TAIL_CHARS).collect();
-    let dropped = total - SPILL_HEAD_CHARS - SPILL_TAIL_CHARS;
+
     format!(
-        "{head}\n…（共 {total} 字符，中间省略 {dropped} 字符；完整输出已保存到 {}。{cmd_hint}。）\n{tail}",
-        path.display()
+        "{}\n…（{dropped_note}；完整输出已保存到 {}。仅当你还需要省略的中间内容时才{}该文件，否则当前头尾摘要已足够。）\n{}",
+        head.join("\n"),
+        path.display(),
+        fetch_hint,
+        tail.join("\n")
     )
 }
 
