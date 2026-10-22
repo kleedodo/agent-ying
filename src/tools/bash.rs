@@ -53,9 +53,13 @@ fn spill_to_summary(s: &str, path: &Path) -> String {
         let a = head.len() + 1;
         let b = lines.len() - tail.len();
         let fetch = if is_gz {
-            format!("用 `zcat` + `sed -n '{a},{b}p'` 查看")
+            // read 不解压，gz 仍走 bash
+            format!(
+                "用 bash 执行 `zcat {} | sed -n '{a},{b}p'` 查看",
+                path.display()
+            )
         } else {
-            format!("用 `sed -n '{a},{b}p'` 查看")
+            format!("用 read 工具查看（offset={a}, limit={}）", b - a + 1)
         };
         (format!("共 {} 行，已省略第 {a}–{b} 行", lines.len()), fetch)
     } else {
