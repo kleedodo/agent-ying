@@ -54,13 +54,11 @@ impl Skills {
         if self.skills.is_empty() {
             return None;
         }
-        let mut out = String::from("\n\n## 技能\n\n以下技能为特定任务提供专门指令：\n");
-        out.push_str("- 如果用户只是简单询问有哪些技能，不用读取具体的内容，直接回复即可。\n");
-        out.push_str("- 当任务匹配某个技能的描述时，用 read 工具读取该技能的文件\n");
-        out.push_str(
-            "- 当技能文件引用相对路径时，以技能目录（SKILL.md 的父目录 / 路径的 dirname）为基准解析，并在工具命令中使用该绝对路径。\n",
-        );
-        out.push_str("- 技能文件内容里提到的所有环境变量，不允许读取和打印它们的值，只允许确认它们是否存在或者直接使用即可\n");
+        let mut out = String::from("\n\n## 技能(skills)\n");
+        out.push_str("- 只是询问有哪些技能，不读取具体内容，列出skill名字即可。\n");
+        out.push_str("- 当任务匹配技能的描述时，用 read 工具读取该技能的文件\n");
+        out.push_str("- 当技能文件内容引用相对路径时，以技能目录（SKILL.md 的父目录）为基准。\n");
+        out.push_str("- 技能文件提到的所有环境变量，不读取和打印具体的值，直接使用\n");
         out.push_str("\n<available_skills>\n");
         for s in &self.skills {
             out.push_str(&format!(
