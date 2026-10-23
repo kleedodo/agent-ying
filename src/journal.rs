@@ -116,7 +116,8 @@ impl SessionFile {
                 tracing::warn!("journal： 消息序列化失败，跳过第 {} 条", i + 1);
                 continue;
             };
-            let v = Self::strip_inlines(self, v).await;
+            let mut v = Self::strip_inlines(self, v).await;
+            Self::strip_native(&mut v);
             let line = json!({
                 "ts": Local::now().to_rfc3339_opts(SecondsFormat::Secs, true),
                 "round": round_id.to_string(),
@@ -260,6 +261,36 @@ impl SessionFile {
         obj.insert("image_ref".into(), json!(format!("images/{name}")));
     }
 
+    /// 剥掉 rig 的 provider 回放数据（journal 只读、不会重放回 provider）：
+    /// assistant 消息的 origin，content item 上的 native
+    /// （native.item 里的 text/arguments 与外层字段完全重复，是纯冗余），
+    /// toolcall 的 id 与 toolresult 的 call（关联 id，单看日志用不上）。
+    /// 注意保留 stop（length/error/aborted 等终态信息不可从内容推导）。
+    /// 定向按位置删，避免误伤工具输出 JSON 里恰好同名的字段
+    fn strip_native(v: &mut Value) {
+        let Some(obj) = v.as_object_mut() else {
+            return;
+        };
+        if obj.get("role").and_then(Value::as_str) == Some("assistant") {
+            obj.remove("origin");
+        }
+        let Some(items) = obj.get_mut("content").and_then(Value::as_array_mut) else {
+            return;
+        };
+        for item in items.iter_mut() {
+            let Some(o) = item.as_object_mut() else {
+                continue;
+            };
+            o.remove("native");
+            let t = o.get("type").and_then(Value::as_str);
+            if t == Some("toolcall") {
+                o.remove("id");
+            } else if t == Some("toolresult") {
+                o.remove("call");
+            }
+        }
+    }
+
     /// 工具结果文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 输出会被工具侧
     /// 截成头尾摘要）。若文本里带保存位置提示，附 result_ref 指向 toolout/ 里的原始全文
     /// （模型可用它取回被省略的中间部分）
@@ -377,6 +408,52 @@ mod tests {
         assert!(!line.contains("aGVsbG8="));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn strip_native_removes_replay_data() {
+        // assistant 消息：origin/stop + item 级 native（text 与 toolcall 都带）
+        let mut v = json!({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "回复", "native": {"item": {"text": "回复"}, "fingerprint": "x"}},
+                {"type": "toolcall", "id": {"provider": "c1"},
+                 "function": {"name": "bash", "arguments": {"command": "ls"}},
+                 "native": {"item": {"arguments": "{}"}, "fingerprint": "y"}}
+            ],
+            "origin": {"api": "openai", "model": "gpt"},
+            "stop": {"type": "tooluse"}
+        });
+        SessionFile::strip_native(&mut v);
+        assert!(v.get("origin").is_none());
+        // stop 保留（终态信息不可从内容推导）
+        assert_eq!(v["stop"], json!({"type": "tooluse"}));
+        assert!(v["content"][0].get("native").is_none());
+        assert!(v["content"][1].get("native").is_none());
+        // toolcall 的关联 id 也删
+        assert!(v["content"][1].get("id").is_none());
+        // 正文字段不受影响
+        assert_eq!(v["content"][0]["text"], "回复");
+        assert_eq!(v["content"][1]["function"]["name"], "bash");
+
+        // toolresult 的 call 删掉，name/content 保留
+        let mut v3 = json!({
+            "role": "user",
+            "content": [{"type": "toolresult", "call": {"provider": "c1"}, "name": "bash",
+                         "content": [{"type": "text", "text": "out"}]}]
+        });
+        SessionFile::strip_native(&mut v3);
+        assert!(v3["content"][0].get("call").is_none());
+        assert_eq!(v3["content"][0]["name"], "bash");
+        assert_eq!(v3["content"][0]["content"][0]["text"], "out");
+
+        // 工具输出 JSON 里恰好叫 native 的字段不能被误删
+        let mut v2 = json!({
+            "role": "user",
+            "content": [{"type": "text", "text": r#"{"native": 1}"#}]
+        });
+        SessionFile::strip_native(&mut v2);
+        assert_eq!(v2["content"][0]["text"], r#"{"native": 1}"#);
     }
 
     #[test]
