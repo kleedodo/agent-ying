@@ -7,71 +7,37 @@ use serde::Deserialize;
 
 use super::{ToolCtx, ToolErr, record_tool_result};
 
-/// bash 输出超过该字符数时返回头尾摘要（全文始终落盘）
-/// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给摘要让模型按需取
-const MAX_OUTPUT_CHARS: usize = 16000;
-/// 摘要中保留的头部字符数（MAX_OUTPUT_CHARS 按 5:3 分给头部）
-const SPILL_HEAD_CHARS: usize = MAX_OUTPUT_CHARS * 5 / 8;
-/// 摘要中保留的尾部字符数（补齐剩余，硬性保证两者之和等于 MAX_OUTPUT_CHARS）
-const SPILL_TAIL_CHARS: usize = MAX_OUTPUT_CHARS - SPILL_HEAD_CHARS;
+/// bash 输出预算：50KB（字节）与 2000 行谁先到按谁，与 read 工具的单页上限（50KB / 2000 行）对齐
+/// 输出会进多轮历史、每轮重复送给模型，故阈值偏保守：够多数命令用，超出就只给头部让模型按需取
+const MAX_OUTPUT_BYTES: usize = 50 * 1024;
+const MAX_OUTPUT_LINES: usize = 2000;
 
-/// 把超长的 bash 输出截成头 + 尾摘要，注明省略的行区间和全文保存位置
+/// 把超长的 bash 输出截成头部（按行边界，始终保持行的完整性），
+/// 注明总行数、已保留行数、下一行的行号和全文保存位置
 /// 提示措辞刻意用"仅当需要时"的条件式，避免诱导模型在信息已足够时二次调用
+/// toolout 文件一律纯文本，所以统一用 read 工具（offset/limit）分页，任意深度都能读到
 fn spill_to_summary(s: &str, path: &Path) -> String {
-    let total = s.chars().count();
-    if total <= MAX_OUTPUT_CHARS {
+    let total_lines = s.lines().count();
+    // 从头按行取，字节数和行数任一预算用完即停，保证不切碎行
+    let mut kept: Vec<&str> = Vec::new();
+    let mut bytes = 0;
+    for line in s.lines() {
+        if kept.len() == MAX_OUTPUT_LINES || bytes + line.len() + 1 > MAX_OUTPUT_BYTES {
+            break;
+        }
+        let n = line.len() + 1;
+        kept.push(line);
+        bytes += n;
+    }
+    if kept.len() == total_lines {
         return s.to_string();
     }
-    let lines: Vec<&str> = s.lines().collect();
-    // 从两端按行取，各自不超字符预算，保证按行边界截断不切碎行
-    let mut head: Vec<&str> = Vec::new();
-    let mut h = 0;
-    for line in &lines {
-        let n = line.chars().count() + 1;
-        if h + n <= SPILL_HEAD_CHARS {
-            head.push(line);
-            h += n;
-        } else {
-            break;
-        }
-    }
-    let mut tail: Vec<&str> = Vec::new();
-    let mut t = 0;
-    for line in lines.iter().rev() {
-        let n = line.chars().count() + 1;
-        if t + n <= SPILL_TAIL_CHARS {
-            tail.insert(0, line);
-            t += n;
-        } else {
-            break;
-        }
-    }
-
-    // 完整路径只在保存说明里出现一次，省 token；提示是条件式的，且给出精准取段命令
-    let is_gz = path.extension().and_then(|e| e.to_str()) == Some("gz");
-    let (dropped_note, fetch_hint) = if head.len() + tail.len() < lines.len() {
-        let a = head.len() + 1;
-        let b = lines.len() - tail.len();
-        let fetch = if is_gz {
-            // read 不解压，gz 仍走 bash
-            format!(
-                "用 bash 执行 `zcat {} | sed -n '{a},{b}p'` 查看",
-                path.display()
-            )
-        } else {
-            format!("用 read 工具查看（offset={a}, limit={}）", b - a + 1)
-        };
-        (format!("共 {} 行，已省略第 {a}–{b} 行", lines.len()), fetch)
-    } else {
-        (format!("共 {} 字符", total), "查看该文件".into())
-    };
-
+    let offset = kept.len() + 1;
     format!(
-        "{}\n…（{dropped_note}；完整输出已保存到 {}。仅当你还需要省略的中间内容时才{}该文件，否则当前头尾摘要已足够。）\n{}",
-        head.join("\n"),
-        path.display(),
-        fetch_hint,
-        tail.join("\n")
+        "{}\n…（共 {total_lines} 行，以上为前 {} 行；完整输出已保存到 {}。仅当你还需要省略的内容时才用 read 工具从第 {offset} 行继续读取（offset={offset}，每次最多 2000 行，可反复翻页）；有关键词的话用 grep 工具直接在该文件里搜索更方便；否则当前摘要已足够。）",
+        kept.join("\n"),
+        kept.len(),
+        path.display()
     )
 }
 

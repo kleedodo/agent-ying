@@ -7,8 +7,8 @@
 //!     session-123-ab3f9c2d/         # 每个会话一个目录；/new 之后开新目录
 //!       messages.jsonl              # 每行一条消息；超 1MB 轮转压缩为
 //!                                   # messages-<ts>.jsonl.gz（可 zgrep）
-//!       toolout/                    # 工具结果全文；超 50KB 的 gzip 压缩（可 zgrep）
-//!         <uuid>.txt / <uuid>.txt.gz
+//!       toolout/                    # 工具结果全文，纯文本（可配合 read 工具分页）
+//!         <uuid>.txt
 //!       images/                     # 图片二进制（jsonl 里只留 image_ref）
 //!         <uuid>.jpg
 //!       media/                      # 用户发来的文件（≤50MB 自动下载）
@@ -41,9 +41,6 @@ use crate::config::Config;
 
 /// messages.jsonl 超过该字节数后轮转压缩为 messages-<ts>.jsonl.gz
 const ROTATE_BYTES: u64 = 1024 * 1024;
-/// toolout 文件超过该字节数才 gzip 压缩，更小的保留纯文本直接可读
-pub const COMPRESS_MIN_BYTES: usize = 50 * 1024;
-
 /// gzip 压缩（纯 CPU，调用方在 spawn_blocking 里执行，避免阻塞异步运行时）
 pub(crate) fn gzip_bytes(data: &[u8]) -> Vec<u8> {
     let mut enc = GzEncoder::new(Vec::new(), Compression::fast());
@@ -463,8 +460,8 @@ mod tests {
             "a1b2c3d4"
         );
         assert_eq!(extract_toolout_ref(&note).as_deref(), Some("a1b2c3d4.txt"));
-        let gz = "…完整输出已保存到 /a/b/toolout/eff.txt.gz。";
-        assert_eq!(extract_toolout_ref(gz).as_deref(), Some("eff.txt.gz"));
+        let plain = "…完整输出已保存到 /a/b/toolout/eff.txt。";
+        assert_eq!(extract_toolout_ref(plain).as_deref(), Some("eff.txt"));
         assert_eq!(extract_toolout_ref("没有提示的普通文本"), None);
     }
 

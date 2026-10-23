@@ -140,17 +140,17 @@ vision agent（看图工具）有自己独立的系统提示词，同样支持�
     └── session-123-ab3f9c2d/
         ├── messages.jsonl           # 每行一条消息：{ts, round, seq, msg}
         ├── messages-*.jsonl.gz      # jsonl 超 1MB 后轮转压缩而来
-        ├── toolout/                 # 工具结果全文：<uuid>.txt，超 50KB 的 gzip 为 <uuid>.txt.gz
+        ├── toolout/                 # 工具结果全文，纯文本 <uuid>.txt（可配合 read 工具分页）
         ├── images/                  # 用户发来的图片（内嵌消息里的 base64 解码落盘），<uuid>.jpg
         └── media/                   # 用户发来的文件自动落盘（图片、≤50MB 的文档/视频/音频），<uuid>-<原文件名>
 ```
 
 - `round` 是本轮的 uuid（每次用户消息一个）,`seq` 是轮内序号；流异常时至少会记录用户消息
-- 工具结果：文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 的超长输出会被截成头尾摘要、原始全文落 `toolout/`）；若文本里带保存位置，附 `result_ref` 指向 `toolout/` 里的原始全文文件
+- 工具结果：文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 的超长输出会被截成前 50KB、原始全文落 `toolout/`）；若文本里带保存位置，附 `result_ref` 指向 `toolout/` 里的原始全文文件
 - 图片：base64 不留在 jsonl 里，解码后存入同级 `images/`，消息里只留 `image_ref: "images/<uuid>.jpg"`
 - 媒体：`forward_to_vision` 时用户发的图片，以及 ≤50MB 的文档/视频/音频，落盘到 `media/`（命名 `<uuid>-<原文件名>`），jsonl 里只在消息文本中带落盘路径
-- 另外，所有工具返回给模型前都会把全文落盘到当前会话的 `toolout/`；目前只有 bash 的超长输出会截成头尾摘要并在返回文本中注明保存位置，模型可用 bash 按需查看
-- toolout 文件超过 50KB 才 gzip 压缩（小结果保留纯文本），轮转的 jsonl 一律 gzip；压缩文件可用 `zgrep 关键词 …` 查看/搜索；单个工具结果最多保存前 256MB
+- 另外，所有工具返回给模型前都会把全文落盘到当前会话的 `toolout/`；目前只有 bash 的超长输出会截成前 50KB 并在返回文本中附上提示，模型用 read 工具（offset/limit）即可分页读取任意深度的全文
+- toolout 文件一律纯文本（方便 read 工具分页），轮转的 jsonl 仍用 gzip，可用 `zgrep 关键词 …` 查看/搜索；单个工具结果最多保存前 256MB
 - 没有定期清理；需要腾空间时按会话目录（或月目录）整删即可，会话目录是自包含单位，引用都是相对路径，搬走不会失效
 
 ## 技术要点

@@ -27,27 +27,17 @@ pub struct ToolErr(pub String);
 /// 单个落盘文件的硬上限：完整输出超过该字节数时只保存前 256MB（按字符边界截断）
 const MAX_SPILL_BYTES: usize = 256 * 1024 * 1024;
 
-/// 所有工具结果都全文落盘到会话的 `toolout/` 目录（见 ToolCtx::toolout_dir）：
-/// 超过 [crate::journal::COMPRESS_MIN_BYTES] 的 gzip 压缩为 `<uuid>.txt.gz`，更小的保留纯文本 `<uuid>.txt`。
+/// 所有工具结果都全文落盘到会话的 `toolout/` 目录（见 ToolCtx::toolout_dir），一律纯文本 `<uuid>.txt`：
+/// 不做 gzip 压缩，这样模型收到截断提示后可以配合 read 工具（offset/limit）分页读取任意深度的全文。
 /// 本函数只负责落盘并返回保存路径；展示给模型的文本完全由调用方决定
-/// （目前只有 bash 把超长输出截成头尾摘要，其余工具原样返回）。
+/// （目前只有 bash 把超长输出截成前 50KB 并附提示，其余工具原样返回）。
 pub async fn record_tool_result(dir: &Path, s: &str) -> Result<std::path::PathBuf, ToolErr> {
     let id = Uuid::new_v4().simple().to_string();
 
     // 单文件硬上限：只保存前 256MB（不跨字符边界）
     let end = s.floor_char_boundary(MAX_SPILL_BYTES.min(s.len()));
-    let data = s.as_bytes()[..end].to_vec();
-
-    // 超过 50KB 才 gzip 压缩，小文件保留纯文本直接可读
-    let (path, payload) = if data.len() > crate::journal::COMPRESS_MIN_BYTES {
-        let compressed = tokio::task::spawn_blocking(move || crate::journal::gzip_bytes(&data))
-            .await
-            .map_err(|e| ToolErr(format!("gzip 任务 join 失败：{e}")))?;
-        (dir.join(format!("{id}.txt.gz")), compressed)
-    } else {
-        (dir.join(format!("{id}.txt")), data)
-    };
-    tokio::fs::write(&path, &payload)
+    let path = dir.join(format!("{id}.txt"));
+    tokio::fs::write(&path, s.as_bytes()[..end].to_vec())
         .await
         .map_err(|e| ToolErr(format!("写入完整输出 {} 失败：{e}", path.display())))?;
     Ok(path)
