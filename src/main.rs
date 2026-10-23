@@ -4,6 +4,7 @@ mod handlers;
 mod image;
 mod journal;
 mod media;
+mod roles;
 mod send;
 mod skills;
 mod tools;
@@ -47,7 +48,6 @@ struct AppState {
     sessions: Arc<Mutex<HashMap<ChatId, journal::SessionFile>>>,
     /// 未授权用户回复节流：UserId → (窗口内首次回复时间, 窗口内已回复次数)
     unauth_replies: Arc<Mutex<HashMap<UserId, (tokio::time::Instant, u32)>>>,
-    name: String,
     model: String,
     /// 是否把用户发来的图片转发给 vision 工具；true 且 vision 已启用时，图片存会话 media/ 目录并转发
     forward_to_vision: bool,
@@ -55,7 +55,14 @@ struct AppState {
     /// None 表示 vision_model 留空、未启用 vision agent
     vision_client: Option<openai::OpenAI>,
     vision_system_prompt: String,
-    system_prompt: String,
+    /// skills 索引块，拼在系统提示词最末尾
+    skills_block: Option<String>,
+    /// 启动时的默认角色名（内置 default 或 config.json 的 role）
+    default_role: String,
+    /// 每个 chat 当前选中的角色（None = 用默认角色）
+    current_roles: Arc<Mutex<HashMap<ChatId, Option<String>>>>,
+    /// 每个 chat 缓存的系统提示词（/new 或 /role 切换时重新读取文件重建）
+    system_prompts: Arc<Mutex<HashMap<ChatId, String>>>,
     bash_timeout: Duration,
     approval_timeout: Duration,
     allowed_user_ids: Vec<UserId>,
@@ -66,15 +73,46 @@ struct AppState {
     stream_edit_interval: Duration,
 }
 
+/// rig agent 的内部标识名（仅用于 agent 框架内部，不影响对用户的回复）
+const AGENT_NAME: &str = "agent-ying";
+
 impl AppState {
     /// 列表为空则允许所有人。
     fn allows_user(&self, user_id: UserId) -> bool {
         self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
     }
+
+    /// 重建系统提示词：SYSTEM.md（缺省回退内置默认值） + 角色人设（None = 默认角色），
+    /// 末尾追加 skills 索引块。
+    pub fn build_prompt(&self, role: Option<&str>) -> String {
+        let role = role.unwrap_or(&self.default_role);
+        let mut prompt = roles::compose_system_prompt(Some(role));
+        if let Some(block) = &self.skills_block {
+            prompt.push_str(block);
+        }
+        prompt
+    }
+
+    /// 取某个 chat 当前生效的系统提示词（没有缓存则按当前角色重建）
+    async fn prompt_for(&self, chat_id: ChatId) -> String {
+        let role = self
+            .current_roles
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned()
+            .flatten();
+        self.system_prompts
+            .lock()
+            .await
+            .entry(chat_id)
+            .or_insert_with(|| self.build_prompt(role.as_deref()))
+            .clone()
+    }
 }
 
 impl AppState {
-    fn agent_for(
+    async fn agent_for(
         &self,
         chat_id: ChatId,
         toolout_dir: std::path::PathBuf,
@@ -85,9 +123,10 @@ impl AppState {
             toolout_dir,
             tg_user_id,
         };
+        let system_prompt = self.prompt_for(chat_id).await;
         let mut builder = AgentBuilder::new(self.client.completion(self.model.clone()))
-            .name(&self.name)
-            .preamble(&self.system_prompt)
+            .name(AGENT_NAME)
+            .preamble(&system_prompt)
             .tool(Bash(ctx.clone()))
             .tool(Read(ctx.clone()))
             .tool(Write(ctx.clone()))
@@ -162,8 +201,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // vision_model 留空（或省略）则不启用 vision agent
     let vision_enabled = !config.vision_model.trim().is_empty();
     tracing::info!(
-        "配置加载完成： name={}, model={}, base_url={}, bash 超时 {}s， 审批超时 {}s， 白名单 {} 人， temperature={}, max_turns={}, max_tokens={}",
-        config.name,
+        "配置加载完成： model={}, base_url={}, bash 超时 {}s， 审批超时 {}s， 白名单 {} 人， temperature={}, max_turns={}, max_tokens={}",
         config.model,
         config
             .openai_base_url
@@ -218,17 +256,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     };
     // 加载 skills（固定目录 ~/.agent-ying/skills/），把索引拼到系统提示末尾
     let skills = Skills::load(Config::skills_dir());
-    let mut system_prompt = config.resolve_system_prompt();
-    if let Some(block) = skills.render_block() {
-        system_prompt.push_str(&block);
-    }
+    let skills_block = skills.render_block();
     tracing::info!("已加载 {} 个 skill", skills.skills.len());
 
-    // 先清空已有的命令，再注册 /new，避免上次残留的命令
+    // 启动时扫描一次 roles/，方便在日志里看到有哪些角色
+    let startup_roles = roles::scan_roles();
+    tracing::info!(
+        "roles 目录（{}）： {}",
+        roles::roles_dir().display(),
+        if startup_roles.is_empty() {
+            "无角色文件".to_string()
+        } else {
+            format!(
+                "{} 个角色: {}",
+                startup_roles.len(),
+                startup_roles.join(", ")
+            )
+        }
+    );
+    // 解析默认角色：config.json 配置了 role 且文件存在则用它，否则用内置 default
+    let default_role = if config.role.trim().is_empty() {
+        roles::DEFAULT_ROLE_NAME.to_string()
+    } else if roles::has_file_role(&config.role) {
+        config.role.clone()
+    } else {
+        tracing::warn!(
+            "配置的角色 {:?} 在 {} 下不存在，回退到内置默认角色 {}",
+            config.role,
+            roles::roles_dir().display(),
+            roles::DEFAULT_ROLE_NAME
+        );
+        roles::DEFAULT_ROLE_NAME.to_string()
+    };
+    tracing::info!("默认角色： {default_role}");
+
+    // 先清空已有的命令，再注册，避免上次残留的命令
     bot.set_my_commands(Vec::<BotCommand>::new()).await?;
-    bot.set_my_commands([BotCommand::new("new", "开启新会话（清空对话历史）")])
-        .await?;
-    tracing::info!("Telegram bot 就绪，已注册命令 /new");
+    bot.set_my_commands([
+        BotCommand::new("new", "开启新会话（清空对话历史并重新加载提示词）"),
+        BotCommand::new("roles", "查看可用角色"),
+        BotCommand::new("role", "切换角色： /role <角色名>"),
+    ])
+    .await?;
+    tracing::info!("Telegram bot 就绪，已注册命令 /new /roles /role");
 
     let state = AppState {
         bot: bot.clone(),
@@ -238,13 +308,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         journal: Journal::new(),
         sessions: Arc::new(Mutex::new(HashMap::new())),
         unauth_replies: Arc::new(Mutex::new(HashMap::new())),
-        name: config.name,
         model: config.model,
+        default_role,
         forward_to_vision: config.forward_to_vision,
         vision_model: config.vision_model,
         vision_client,
         vision_system_prompt,
-        system_prompt,
+        skills_block,
+        current_roles: Arc::new(Mutex::new(HashMap::new())),
+        system_prompts: Arc::new(Mutex::new(HashMap::new())),
         bash_timeout,
         approval_timeout,
         allowed_user_ids: config.allowed_user_ids,

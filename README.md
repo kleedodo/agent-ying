@@ -37,7 +37,6 @@ cargo build --release
   "telegram_bot_token": "123456:ABC...",
   "openai_api_key": "sk-...",
   "openai_base_url": "https://openrouter.ai/api/v1",
-  "name": "荧",
   "model": "gpt-5-mini",
   "forward_to_vision": true,
   "vision_model": "gpt-5-mini",
@@ -58,7 +57,7 @@ cargo build --release
 | `telegram_bot_token` | **必填**。Telegram bot token，形如 `123456:ABC...` |
 | `openai_api_key` | **必填**。OpenAI API key |
 | `openai_base_url` | OpenAI 兼容服务的 base URL，留空则用官方 `https://api.openai.com/v1` |
-| `name` | agent 名字，默认「荧」 |
+| `role` | 启动时的默认角色：加载 `~/.agent-ying/roles/` 下对应的 `.md` 文件；留空（或省略）则用内置默认角色（「荧」的人设）；配置了但文件不存在时打印警告并回退到内置默认角色 |
 | `model` | 模型名，如 `gpt-5-mini`、`gpt-5` |
 | `forward_to_vision` | 是否把用户发来的图片转发给 vision 工具（即主模型本身非多模态、不能直接看图），默认 `true`；为 `true` 且 vision 已启用时，图片压缩后存到会话 `media/` 目录（`~/.agent-ying/journals/<月>/<会话>/media/`），由主 agent 调 vision 工具查看；为 `false` 或 vision 未启用时图片以 data URL 内嵌发给主模型 |
 | `vision_model` | 看图工具（vision）用的模型，需支持多模态；**留空（或省略）则不启用 vision agent**。注意：`forward_to_vision: true`（默认）时建议启用，否则用户发来的图片会原样发给主模型（主模型可能看不到） |
@@ -82,12 +81,36 @@ cargo run --release
 
 ## 系统提示词
 
-主 agent 的系统提示词按优先级从高到低：
+主 agent 的系统提示词按顺序拼接（缺失的部分跳过）：
 
-1. `~/.agent-ying/SYSTEM.md`（存在则用其内容）
-2. 代码内默认人设（「荧」:18 岁、住在用户电脑里的女朋友）
+1. `~/.agent-ying/SYSTEM.md`（存在则用其内容，不存在则用代码内通用规则）
+2. 角色人设：内置默认角色（default，即「荧」的 18 岁女朋友人设）或 `~/.agent-ying/roles/<角色>.md`
+3. skills 索引块（始终追加在最末尾）
 
-提示词中可以使用 `{{char}}` 占位符，会被自动替换为配置里的 `name`。
+### 默认角色
+
+`config.json` 的 `role` 字段决定启动时的默认角色：
+
+- 留空：用内置默认角色（default）
+- 配置为某个角色名：启动时加载 `~/.agent-ying/roles/<角色名>.md`
+- 配置了但文件不存在：打印警告日志并回退到内置默认角色
+
+### 角色（Roles）
+
+`~/.agent-ying/roles/` 下的每个 `.md` 文件就是一个角色，文件名（去扩展名）即角色名：
+
+```
+~/.agent-ying/roles/
+├── ying.md
+└── dodoco.md
+```
+
+- `/roles`：查看可用角色（默认角色始终可用，roles/ 下的每个 `.md` 文件一个角色）
+- `/role <角色名>`：切换角色并立即重新载入系统提示词（按 chat 生效，不影响其他会话）；`/role <默认角色名>` 切回默认
+- `/role`：查看当前 chat 的角色
+- `/new`：开启新会话（清空历史）时也会重新读取文件、重建系统提示词
+
+提示词在 `/new` 和 `/role` 时从磁盘重新读取，修改 `SYSTEM.md` 或角色文件后无需重启进程。
 
 vision agent（看图工具）有自己独立的系统提示词，同样支持覆盖：
 

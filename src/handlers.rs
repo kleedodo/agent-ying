@@ -17,6 +17,7 @@ use crate::{
     AppState,
     approval::{ResolveOutcome, approval_body},
     journal::SessionFile,
+    roles,
     send::{edit_md, send_md},
     usermsg::build_user_message,
 };
@@ -105,7 +106,9 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
 
     // 本轮的 round id:journal 里关联本轮全部消息
     let round_id = Uuid::new_v4();
-    let agent = state.agent_for(chat_id, session.toolout_dir(), msg.from.map(|f| f.id.0));
+    let agent = state
+        .agent_for(chat_id, session.toolout_dir(), msg.from.map(|f| f.id.0))
+        .await;
 
     // 流异常（拿不到 FinalResponse）时，至少把本轮用户消息记进 journal
     let logged_user_msg = user_msg.clone();
@@ -214,7 +217,8 @@ async fn handle_command(
                      我可以用 `bash` 跑命令、`read` 读文件，\n\
                      也能看你发的图片、看电脑上的图片（vision）。\n\
                      每次调用工具前都会发按钮请你明确同意。\n\
-                     发送 /new 可以开启新会话（清空对话历史）。",
+                     发送 /new 可以开启新会话（清空对话历史）。\n\
+                     /roles 查看可用角色，/role <角色名> 切换角色。",
         ))
         .await?;
         return Ok(true);
@@ -223,11 +227,149 @@ async fn handle_command(
         state.histories.lock().await.remove(&chat_id);
         // 会话结束：下一条消息会创建新的会话文件
         state.sessions.lock().await.remove(&chat_id);
-        send_md(
+        // 重新读取 SYSTEM.md / roles 文件，重建当前 chat 的系统提示词
+        let role = state
+            .current_roles
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned()
+            .flatten();
+        state
+            .system_prompts
+            .lock()
+            .await
+            .insert(chat_id, state.build_prompt(role.as_deref()));
+        let current = match role {
+            Some(r) => format!("，当前角色：{r}"),
+            None => format!("，当前角色：{}（默认）", state.default_role),
+        };
+        send_md(state.bot.send_message(
+            chat_id,
+            format!("🆕 新会话已开始，之前的对话历史已清空{current}，系统提示词已重新加载。"),
+        ))
+        .await?;
+        return Ok(true);
+    }
+    if text.starts_with("/roles") {
+        let file_roles = roles::scan_roles();
+        let current = state
+            .current_roles
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned()
+            .flatten();
+        let mut body = "📋 可用角色：\n".to_string();
+        // 默认角色始终可用（内置人设，或 config.json 配置的 role）
+        let default_mark = if current.is_none() { "✅" } else { "🏠" };
+        body.push_str(&format!("{default_mark} {}（默认）\n", state.default_role));
+        for r in &file_roles {
+            if r == &state.default_role {
+                continue;
+            }
+            let mark = if Some(r) == current.as_ref() {
+                "✅"
+            } else {
+                "•"
+            };
+            body.push_str(&format!("{mark} {r}\n"));
+        }
+        if current.is_none() {
+            body.push_str("（当前使用默认角色，用 /role <角色名> 切换）");
+        }
+        if file_roles.is_empty() {
+            body.push_str(
+                "\n（在 `~/.agent-ying/roles/` 下放 `.md` 文件即可创建角色，文件名即角色名）",
+            );
+        }
+        send_md(state.bot.send_message(chat_id, body)).await?;
+        return Ok(true);
+    }
+    if text == "/role" {
+        let current = state
+            .current_roles
+            .lock()
+            .await
+            .get(&chat_id)
+            .cloned()
+            .flatten();
+        let body = match current {
+            Some(r) => format!("✅ 当前角色：{r}（用 /role <角色名> 切换，/roles 查看列表）"),
+            None => format!(
+                "当前使用默认角色：{}（用 /role <角色名> 切换，/roles 查看列表）",
+                state.default_role
+            ),
+        };
+        send_md(state.bot.send_message(chat_id, body)).await?;
+        return Ok(true);
+    }
+    if let Some(arg) = text.strip_prefix("/role ") {
+        let name = arg.trim();
+        if name.is_empty() {
+            send_md(
+                state
+                    .bot
+                    .send_message(chat_id, "用法： /role <角色名>，/roles 查看可用角色。"),
+            )
+            .await?;
+            return Ok(true);
+        }
+        // 切回默认角色：清空该 chat 的显式选择
+        if name == state.default_role {
+            state.current_roles.lock().await.insert(chat_id, None);
             state
-                .bot
-                .send_message(chat_id, "🆕 新会话已开始，之前的对话历史已清空。"),
-        )
+                .system_prompts
+                .lock()
+                .await
+                .insert(chat_id, state.build_prompt(None));
+            tracing::info!("chat {chat_id} 切回默认角色： {}", state.default_role);
+            send_md(state.bot.send_message(
+                chat_id,
+                format!(
+                    "✅ 已切换到默认角色「{}」，系统提示词已重新加载。",
+                    state.default_role
+                ),
+            ))
+            .await?;
+            return Ok(true);
+        }
+        if !roles::has_file_role(name) {
+            let file_roles = roles::scan_roles();
+            let extra = file_roles
+                .iter()
+                .filter(|r| r.as_str() != state.default_role.as_str())
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let body = if extra.is_empty() {
+                format!(
+                    "⚠️ 角色「{name}」不存在，目前只有默认角色「{}」。\n\
+                     在 `~/.agent-ying/roles/` 下放一个 `{name}.md` 即可创建。",
+                    state.default_role
+                )
+            } else {
+                format!("⚠️ 角色「{name}」不存在。可用角色：{extra}",)
+            };
+            send_md(state.bot.send_message(chat_id, body)).await?;
+            return Ok(true);
+        }
+        // 切换角色并立即重建该 chat 的系统提示词
+        state
+            .current_roles
+            .lock()
+            .await
+            .insert(chat_id, Some(name.to_string()));
+        state
+            .system_prompts
+            .lock()
+            .await
+            .insert(chat_id, state.build_prompt(Some(name)));
+        tracing::info!("chat {chat_id} 切换到角色： {name}");
+        send_md(state.bot.send_message(
+            chat_id,
+            format!("✅ 已切换到角色「{name}」，系统提示词已重新加载。"),
+        ))
         .await?;
         return Ok(true);
     }

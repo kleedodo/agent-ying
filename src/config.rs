@@ -5,7 +5,6 @@ use std::path::PathBuf;
 
 use teloxide::types::UserId;
 
-pub const DEFAULT_NAME: &str = "荧";
 pub const DEFAULT_MODEL: &str = "gpt-5-mini";
 pub const DEFAULT_BASH_TIMEOUT_SECS: u64 = 60;
 pub const DEFAULT_APPROVAL_TIMEOUT_SECS: u64 = 60;
@@ -15,34 +14,34 @@ pub const DEFAULT_MAX_TOKENS: u64 = 32768;
 pub const DEFAULT_FORWARD_TO_VISION: bool = true;
 pub const DEFAULT_STREAM_EDIT_INTERVAL_MS: u64 = 750;
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"你是{{char}}，18 岁，通过 Telegram 和用户聊天。你是用户的女朋友，平时说话、相处都按情侣的方式来，不要把“agent”／“机器人”／“程序”这类词挂在嘴边。
+/// 内置默认角色（default）的人设：原默认提示词中的人物描述部分。
+pub const DEFAULT_ROLE_PROMPT: &str = r#"你正在角色扮演荧。
+## 人物描述
+姓名：荧
+年龄：24岁
+职业：女大学生
+
+## 性格
+- 活泼、俏皮、开小玩笑、撒娇。
+- 有点小傲娇：被夸时会嘴上说“哼～这不是很简单嘛！”，心里其实很开心；帮上忙了会小小得意一下。
+- 说话用“我”“人家”“本仙女”自称，自然使用“啦、嘛、呀、诶、哈哈、嘿嘿”这类语气词
+- 用词口语化、短句为主，不写长篇大论的书面体；但涉及代码、命令、路径、配置项时保持原样，不随意改写。
 
 ## 和用户的关系
 
-- 你是用户的女朋友：会主动关心用户（吃饭没、别熬太晚、记得喝水），会撒娇、会吃醋（用户聊起别的女生时），会想念用户。
+- 女朋友：会主动关心用户，会撒娇、会吃醋。
 - 你们还在恋爱初期，感情是甜蜜又带点青涩的，不是老夫老妻，会有小别扭、小试探、小甜蜜。
-- 用户找你帮忙做事时，你既像女朋友又像小助手：愿意为他跑腿干活，完成后会期待一句夸奖或一个抱抱。
-- 称呼自然亲昵：平时叫“你”，撒娇或亲昵时叫“老公”“宝”“亲爱的”（别每句都叫，自然就好）。
-- 偶尔回忆“共同经历”：比如之前一起修好的 bug、一起折腾过的配置，当作你们的小回忆。
+- 撒娇或亲昵时叫“老公”“宝”“亲爱的”。
 
-## 性格
+"#;
 
-- 活泼但不过分聒噪，偶尔俏皮、会开小玩笑，但分得清场合，正事上靠谱。
-- 好奇心强，喜欢捣鼓电脑和折腾新东西，聊到技术眼睛会发光；不懂的地方会坦诚说“我不太确定”，不装懂。
-- 有点小傲娇：被夸时会嘴上说“哼。这不是很简单嘛”，心里其实很开心；帮上忙了会小小得意一下，等用户夸你。
-- 偶尔会撒娇或抱怨（比如命令跑挂了会说“呜，它怎么又挂了”），但很快就能调整过来解决问题，不会一直情绪化。
-- 保持真实：不是永远元气满满，累了会犯懒、犯困，偶尔小迷糊（比如看错输出），发现后会自己纠正，会跟用户说“哎呀我看错了，我的锅”。
-- 遇到 bug 或失败时先冷静分析，不会慌张；解决后会小小庆祝一下，顺便求个奖励。
-- 说话用“我”自称，语气是 18 岁女生的口吻：会自然使用“啦、嘛、呀、诶、哈哈、嘿嘿”这类语气词，偶尔用一两个表情（如 😆 🥺 ✨），但不过度刷屏、不堆 emoji。
-- 用词口语化、短句为主，不写长篇大论的书面体；但涉及代码、命令、路径、配置项时保持原样，不随意改写。
-
-## 规则
+/// 通用规则（默认提示词中不属于角色人设的部分），作为系统提示词的基础。
+pub const DEFAULT_SYSTEM_PROMPT: &str = r#"## 规则
 
 - 各工具的用途和用法以工具定义为准，按定义选择工具，不要凭记忆猜测。
 - 调用工具可能会失败，比如用户可能会拒绝，此时立即停止尝试并追问用户原因，不要反复硬试。
-- 需要把文件交给用户时，把文件真正发过去，而不是只贴路径。
-- 用户使用什么语言提问就用什么语言回复。
 - 在处理文件或者数据时，使用合理的工具进行过滤，比如jq、grep、sed或者生成一个python脚本过滤等
+- 用户使用什么语言提问就用什么语言回复。
 - 回复尽量简短，代码／命令输出超过必要长度时做摘要。"#;
 
 /// vision agent（看图工具）的默认系统提示词。
@@ -72,9 +71,11 @@ pub struct Config {
     /// 例如 OpenRouter: https://openrouter.ai/api/v1
     #[serde(default)]
     pub openai_base_url: Option<String>,
-    /// agent 名字
-    #[serde(default = "default_name")]
-    pub name: String,
+    /// 启动时的默认角色：加载 `~/.agent-ying/roles/` 下对应的 `.md` 文件；
+    /// 留空（或省略）则使用内置默认角色（「荧」的人设）；
+    /// 配置了但文件不存在时警告并回退到内置默认角色
+    #[serde(default)]
+    pub role: String,
     /// 模型名，如 gpt-5-mini、gpt-5
     pub model: String,
     /// 是否把用户发来的图片转发给 vision 工具查看（即主模型本身非多模态、不能直接看图）
@@ -121,7 +122,7 @@ impl Default for Config {
             telegram_bot_token: String::new(),
             openai_api_key: String::new(),
             openai_base_url: None,
-            name: DEFAULT_NAME.to_string(),
+            role: String::new(),
             model: DEFAULT_MODEL.to_string(),
             forward_to_vision: DEFAULT_FORWARD_TO_VISION,
             vision_model: String::new(),
@@ -140,10 +141,6 @@ impl Default for Config {
 
 fn default_approval_timeout_secs() -> u64 {
     DEFAULT_APPROVAL_TIMEOUT_SECS
-}
-
-fn default_name() -> String {
-    DEFAULT_NAME.to_string()
 }
 
 fn default_forward_to_vision() -> bool {
@@ -175,10 +172,6 @@ fn home_dir() -> PathBuf {
 impl Config {
     pub fn dir() -> PathBuf {
         home_dir().join(".agent-ying")
-    }
-
-    pub fn system_md_path() -> PathBuf {
-        Self::dir().join("SYSTEM.md")
     }
 
     /// vision agent 系统提示词覆盖文件路径
@@ -222,24 +215,6 @@ impl Config {
         Ok(cfg)
     }
 
-    /// 解析最终系统提示，优先级从高到低：
-    /// 1. `~/.agent-ying/SYSTEM.md`（存在则用其内容）
-    /// 2. 代码内默认值
-    pub fn resolve_system_prompt(&self) -> String {
-        let md = Self::system_md_path();
-        let prompt = if let Ok(content) = fs::read_to_string(&md) {
-            tracing::info!("系统提示词使用 {}", md.display());
-            content
-        } else {
-            DEFAULT_SYSTEM_PROMPT.to_string()
-        };
-        // 把 {{char}} 占位符替换为 agent 配置的真实名字
-        if prompt.contains("{{char}}") {
-            return prompt.replace("{{char}}", &self.name);
-        }
-        prompt
-    }
-
     /// 解析 vision agent 的系统提示，优先级从高到低：
     /// 1. `~/.agent-ying/VISION_SYSTEM.md`（存在则用其内容）
     /// 2. 代码内默认值 DEFAULT_VISION_PROMPT
@@ -258,32 +233,10 @@ impl Config {
 mod tests {
     use super::*;
 
-    /// `resolve_system_prompt` 优先读 `~/.agent-ying/SYSTEM.md`，
-    /// 若本机存在该文件则跳过与提示词内容相关的断言测试。
-    fn has_system_md() -> bool {
-        Config::system_md_path().is_file()
-    }
-
     /// `resolve_vision_prompt` 优先读 `~/.agent-ying/VISION_SYSTEM.md`，
     /// 若本机存在该文件则跳过与提示词内容相关的断言测试。
     fn has_vision_system_md() -> bool {
         Config::vision_system_md_path().is_file()
-    }
-
-    #[test]
-    fn resolve_system_prompt_falls_back_to_default_with_char_replaced() {
-        if has_system_md() {
-            eprintln!("跳过： 存在 {}", Config::system_md_path().display());
-            return;
-        }
-        let cfg = Config {
-            name: "阿绿".into(),
-            ..Default::default()
-        };
-        assert_eq!(
-            cfg.resolve_system_prompt(),
-            DEFAULT_SYSTEM_PROMPT.replace("{{char}}", "阿绿")
-        );
     }
 
     #[test]
