@@ -176,6 +176,8 @@ fn build_openai_client(
     base_url: Option<&str>,
 ) -> Result<openai::OpenAI, Box<dyn std::error::Error + Send + Sync>> {
     let mut config = openai::OpenAIConfig::new(api_key.to_string());
+    // rig 0.45 对 OpenAI 方言默认走 /responses，这里显式切到 Chat Completions
+    config.route = Some(openai::Route::Chat);
     if let Some(b) = base_url.filter(|b| !b.is_empty()) {
         config.base_url = b.to_string();
     }
