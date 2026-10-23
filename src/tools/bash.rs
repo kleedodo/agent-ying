@@ -122,10 +122,14 @@ impl Tool for Bash {
         let ctx = &self.0;
         tracing::info!("bash 开始执行：{}", args.command);
 
-        let future = tokio::process::Command::new("bash")
-            .arg("-lc")
-            .arg(&args.command)
-            .output();
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-lc");
+        cmd.arg(&args.command);
+        // 发送者的 Telegram user id 以环境变量暴露，命令里用 $TG_USER_ID 引用
+        if let Some(id) = ctx.tg_user_id {
+            cmd.env("TG_USER_ID", id.to_string());
+        }
+        let future = cmd.output();
 
         match tokio::time::timeout(ctx.bash_timeout, future).await {
             Ok(Ok(output)) => {

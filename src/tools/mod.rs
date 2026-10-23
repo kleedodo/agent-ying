@@ -60,6 +60,8 @@ pub struct ToolCtx {
     pub bash_timeout: std::time::Duration,
     /// 当前会话的 toolout/ 目录，所有工具结果的全文都落盘到这里
     pub toolout_dir: std::path::PathBuf,
+    /// 本轮消息发送者的 Telegram user id（bash 里以 $TG_USER_ID 环境变量暴露）
+    pub tg_user_id: Option<u64>,
 }
 
 /// 把字节数格式化为人类可读的大小（如 `512B`、`1.2MB`）。

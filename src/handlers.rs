@@ -105,7 +105,7 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
 
     // 本轮的 round id:journal 里关联本轮全部消息
     let round_id = Uuid::new_v4();
-    let agent = state.agent_for(chat_id, session.toolout_dir());
+    let agent = state.agent_for(chat_id, session.toolout_dir(), msg.from.map(|f| f.id.0));
 
     // 流异常（拿不到 FinalResponse）时，至少把本轮用户消息记进 journal
     let logged_user_msg = user_msg.clone();

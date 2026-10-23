@@ -74,10 +74,16 @@ impl AppState {
 }
 
 impl AppState {
-    fn agent_for(&self, chat_id: ChatId, toolout_dir: std::path::PathBuf) -> YingAgent {
+    fn agent_for(
+        &self,
+        chat_id: ChatId,
+        toolout_dir: std::path::PathBuf,
+        tg_user_id: Option<u64>,
+    ) -> YingAgent {
         let ctx = ToolCtx {
             bash_timeout: self.bash_timeout,
             toolout_dir,
+            tg_user_id,
         };
         let mut builder = AgentBuilder::new(self.client.completion(self.model.clone()))
             .name(&self.name)
