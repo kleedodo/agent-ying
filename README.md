@@ -65,7 +65,7 @@ cargo build --release
 | `vision_base_url` | vision 专用 base URL，留空则回退到 `openai_base_url`（再留空用官方 `https://api.openai.com/v1`） |
 | `bash_timeout_secs` | bash 工具执行超时（秒），默认 60 |
 | `approval_timeout_secs` | 审批等待超时（秒），超时按拒绝处理，默认 60 |
-| `allowed_user_ids` | 只对这些人提供工具服务（未授权用户只会被告知其 user id），留空则对所有人开放 |
+| `allowed_user_ids` | 只对这些人提供工具服务（未授权用户只会被告知其 user id），留空则谁都不允许 |
 | `temperature` | 采样温度，默认 1.0 |
 | `max_turns` | agent 单次对话最大工具轮数，默认 5000 |
 | `max_tokens` | 单次模型响应最大 token 数，默认 32768 |

@@ -98,7 +98,7 @@ pub struct Config {
     /// 审批等待超时（秒），超过则按拒绝处理
     #[serde(default = "default_approval_timeout_secs")]
     pub approval_timeout_secs: u64,
-    /// 只响应这些 Telegram user id；留空则响应所有人
+    /// 只响应这些 Telegram user id；留空则谁都不允许（未授权用户只会被告知自己的 user id）
     #[serde(default)]
     pub allowed_user_ids: Vec<UserId>,
     /// 采样温度

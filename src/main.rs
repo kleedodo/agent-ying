@@ -77,9 +77,9 @@ struct AppState {
 const AGENT_NAME: &str = "agent-ying";
 
 impl AppState {
-    /// 列表为空则允许所有人。
+    /// 只允许白名单内的 user id；列表为空则谁都不允许。
     fn allows_user(&self, user_id: UserId) -> bool {
-        self.allowed_user_ids.is_empty() || self.allowed_user_ids.contains(&user_id)
+        self.allowed_user_ids.contains(&user_id)
     }
 
     /// 重建系统提示词：SYSTEM.md（缺省回退内置默认值） + 角色人设（None = 默认角色），
