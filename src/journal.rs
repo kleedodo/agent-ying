@@ -15,7 +15,9 @@
 //!         <uuid>-<原文件名>
 //! ```
 //!
-//! 每行一条消息：`{"ts", "round", "seq", "msg"}`。
+//! 第一行是元信息：`{"ts", "journal_meta": {"system_prompt"}}`，记录建会话时的系统提示词；
+//! 会话中途切换角色等导致提示词变化时，再追加同样格式的一行；
+//! 之后每行一条消息：`{"ts", "round", "seq", "msg"}`。
 //! - `round` 是本轮的 uuid（每次用户消息一个）,`seq` 是轮内序号
 //! - 工具结果文本完整写入 jsonl（即 agent 看到的内容；目前只有 bash 把超长输出
 //!   截成头尾摘要）；若文本里带保存位置，附 `result_ref` 指向 toolout/ 里的原始全文
@@ -101,6 +103,48 @@ impl SessionFile {
     /// 用户发来的文件落盘目录（与 jsonl 同级的 media/）
     pub fn media_dir(&self) -> PathBuf {
         self.dir.join("media")
+    }
+
+    /// 把当前系统提示词写入 jsonl 的第一行（会话首次创建时调用一次）。
+    /// 文件已存在（已有消息）则跳过，保证「第一行」始终记录建会话时的提示词。
+    /// 失败只 warn，不阻塞 bot 回复。
+    pub async fn write_first_line(&self, system_prompt: &str) {
+        if tokio::fs::try_exists(&self.path).await.unwrap_or(false) {
+            return;
+        }
+        self.append_prompt_line(system_prompt).await
+    }
+
+    /// 会话中途系统提示词变化（如 /role 切换角色）时追加一行记录。
+    /// 失败只 warn，不阻塞 bot 回复。
+    pub async fn record_prompt_change(&self, system_prompt: &str) {
+        self.append_prompt_line(system_prompt).await
+    }
+
+    /// 追加一行系统提示词记录：`{"ts", "journal_meta": {"system_prompt"}}`
+    async fn append_prompt_line(&self, system_prompt: &str) {
+        let line = json!({
+            "ts": Local::now().to_rfc3339_opts(SecondsFormat::Secs, true),
+            "journal_meta": { "system_prompt": system_prompt },
+        });
+        let Ok(s) = serde_json::to_string(&line) else {
+            tracing::warn!("journal： 系统提示词行编码失败");
+            return;
+        };
+        let Ok(mut file) = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .await
+        else {
+            tracing::warn!("journal： 打开 {} 失败", self.path.display());
+            return;
+        };
+        if let Err(e) = file.write_all(format!("{s}\n").as_bytes()).await {
+            tracing::warn!("journal： 写入 {} 失败： {e}", self.path.display());
+        } else if let Err(e) = file.flush().await {
+            tracing::warn!("journal: flush {} 失败： {e}", self.path.display());
+        }
     }
 
     /// 把一轮的全部消息追加到文件末尾（每条消息一行）。
@@ -463,6 +507,59 @@ mod tests {
         let plain = "…完整输出已保存到 /a/b/toolout/eff.txt。";
         assert_eq!(extract_toolout_ref(plain).as_deref(), Some("eff.txt"));
         assert_eq!(extract_toolout_ref("没有提示的普通文本"), None);
+    }
+
+    #[tokio::test]
+    async fn write_first_line_writes_prompt_once() {
+        let dir = std::env::temp_dir()
+            .join("agent-ying")
+            .join(format!("journal-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = SessionFile {
+            path: dir.join("messages.jsonl"),
+            dir: dir.clone(),
+        };
+
+        session.write_first_line("你是 agent-ying").await;
+        // 重复调用不追加第二行
+        session.write_first_line("你是 agent-ying").await;
+
+        let content = std::fs::read_to_string(&session.path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 1);
+        let v: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v["journal_meta"]["system_prompt"], "你是 agent-ying");
+        assert!(v["ts"].is_string());
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn record_prompt_change_appends_line() {
+        let dir = std::env::temp_dir()
+            .join("agent-ying")
+            .join(format!("journal-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let session = SessionFile {
+            path: dir.join("messages.jsonl"),
+            dir: dir.clone(),
+        };
+
+        // 会话开始：第一行是初始提示词
+        session.write_first_line("角色 A").await;
+        // 中途 /role 切换：再追加一行
+        session.record_prompt_change("角色 B").await;
+
+        let lines: Vec<Value> = std::fs::read_to_string(&session.path)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["journal_meta"]["system_prompt"], "角色 A");
+        assert_eq!(lines[1]["journal_meta"]["system_prompt"], "角色 B");
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -75,6 +75,9 @@ pub async fn on_message(state: AppState, msg: Message) -> HandlerResult {
                     .create_session(chat_id.0)
                     .await
                     .map_err(|e| format!("创建 journal 会话文件失败： {e}"))?;
+                // 第一行写入当前系统提示词（文件已有内容则自动跳过）
+                let prompt = state.prompt_for(chat_id).await;
+                s.write_first_line(&prompt).await;
                 map.insert(chat_id, s.clone());
                 s
             }
@@ -318,11 +321,9 @@ async fn handle_command(
         // 切回默认角色：清空该 chat 的显式选择
         if name == state.default_role {
             state.current_roles.lock().await.insert(chat_id, None);
-            state
-                .system_prompts
-                .lock()
-                .await
-                .insert(chat_id, state.build_prompt(None));
+            let prompt = state.build_prompt(None);
+            record_prompt_change(&state, chat_id, &prompt).await;
+            state.system_prompts.lock().await.insert(chat_id, prompt);
             tracing::info!("chat {chat_id} 切回默认角色： {}", state.default_role);
             send_md(state.bot.send_message(
                 chat_id,
@@ -360,11 +361,9 @@ async fn handle_command(
             .lock()
             .await
             .insert(chat_id, Some(name.to_string()));
-        state
-            .system_prompts
-            .lock()
-            .await
-            .insert(chat_id, state.build_prompt(Some(name)));
+        let prompt = state.build_prompt(Some(name));
+        record_prompt_change(&state, chat_id, &prompt).await;
+        state.system_prompts.lock().await.insert(chat_id, prompt);
         tracing::info!("chat {chat_id} 切换到角色： {name}");
         send_md(state.bot.send_message(
             chat_id,
@@ -374,6 +373,13 @@ async fn handle_command(
         return Ok(true);
     }
     Ok(false)
+}
+
+/// 角色切换导致系统提示词变化时，在会话 journal 里追加一行记录（无活动会话则跳过）
+async fn record_prompt_change(state: &AppState, chat_id: ChatId, prompt: &str) {
+    if let Some(session) = state.sessions.lock().await.get(&chat_id).cloned() {
+        session.record_prompt_change(prompt).await;
+    }
 }
 
 /// 未授权用户回复节流窗口：30 分钟
